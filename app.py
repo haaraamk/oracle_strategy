@@ -19,7 +19,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, date
 # 상단 import문에 추가
-import requests_cache
+import requests_cache 
 from requests import Session
 
 # ══════════════════════════════════════════════════════════════
