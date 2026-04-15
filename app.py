@@ -18,6 +18,9 @@ import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, date
+# 상단 import문에 추가
+import requests_cache
+from requests import Session
 
 # ══════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -52,34 +55,56 @@ div[data-testid="stMetricValue"]            { color:#ddddf0 !important; }
 # ══════════════════════════════════════════════════════════════
 # DATA LAYER
 # ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+# DATA LAYER (Rate Limit 방지 강화 버전)
+# ══════════════════════════════════════════════════════════════
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data(start: str = "2014-01-01"):
-    """Yahoo Finance에서 4개 심볼 다운로드 후 병합."""
+    """
+    야후 파이낸스 차단 방지를 위해 캐시 세션과 User-Agent를 설정하여 데이터를 로드합니다.
+    """
     end = datetime.today().strftime("%Y-%m-%d")
     symbols = {"QQQ": "QQQ", "SOXL": "SOXL", "VIX": "^VIX", "TNX": "^TNX"}
     frames: dict[str, pd.Series] = {}
 
+    # 1. 브라우저처럼 보이게 세션 설정 (가장 중요)
+    session = requests_cache.CachedSession('yfinance.cache')
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+    })
+
     for col, sym in symbols.items():
         try:
-            raw = yf.download(sym, start=start, end=end,
-                              progress=False, auto_adjust=True)
+            # 2. 세션을 인자로 전달하여 다운로드
+            raw = yf.download(
+                sym, 
+                start=start, 
+                end=end,
+                progress=False, 
+                auto_adjust=True,
+                session=session  # 차단 방지용 세션 주입
+            )
+            
             if raw.empty:
-                st.error(f"데이터 없음: {sym}")
+                st.error(f"데이터 없음: {sym} (야후 서버 일시 차단 가능성)")
                 return None
+            
+            # Close 데이터 추출 (yfinance 0.2.x 대응)
             s = raw["Close"]
-            # yfinance 0.2+ 는 MultiIndex 반환 가능 → squeeze
             if isinstance(s, pd.DataFrame):
                 s = s.squeeze()
             frames[col] = s
+            
         except Exception as exc:
             st.error(f"다운로드 실패: {sym} — {exc}")
             return None
 
     df = pd.DataFrame(frames)
-    # QQQ 기준으로 align, 나머지는 ffill (공휴일 등 결측)
+    # 데이터 정제 및 결측치 처리
     df = df.ffill().dropna(subset=["QQQ", "VIX"])
-    # SOXL 이전 기간(2010 이전)은 QQQ 대체
     df["SOXL"] = df["SOXL"].fillna(df["QQQ"])
+    
     return df
 
 
