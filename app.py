@@ -1,11 +1,8 @@
 """
-나스닥 하이브리드 오라클 전략 — 백테스트 & 검증 대시보드
+나스닥 하이브리드 오라클 전략 — 백테스트 & 투자 참고 대시보드
 개인 교육용 | 투자 권유 아님
 """
-
-import warnings
-warnings.filterwarnings("ignore")
-
+import warnings; warnings.filterwarnings("ignore")
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -15,9 +12,8 @@ from plotly.subplots import make_subplots
 from datetime import datetime, date
 import itertools
 
-st.set_page_config(page_title="오라클 전략 검증기", page_icon="🔮",
+st.set_page_config(page_title="오라클 전략 대시보드", page_icon="🔮",
                    layout="wide", initial_sidebar_state="expanded")
-
 st.markdown("""
 <style>
 [data-testid="stAppViewContainer"]  { background:#08080f; }
@@ -26,6 +22,7 @@ st.markdown("""
 h1,h2,h3                            { color:#ddddf0 !important; letter-spacing:-0.02em; }
 div[data-testid="stMetric"]         { background:#10101e; border:0.5px solid #22223a; border-radius:10px; padding:.9rem 1rem !important; }
 div[data-testid="stMetricValue"]    { color:#ddddf0 !important; }
+div[data-testid="stMetricDelta"]    { font-size:13px !important; }
 .stTabs [data-baseweb="tab"]        { color:#5a5a7a; background:transparent; font-size:15px; }
 .stTabs [aria-selected="true"]      { color:#a0a8ff !important; border-bottom:2px solid #6366f1 !important; }
 .stTabs [data-baseweb="tab-list"]   { background:transparent; border-bottom:1px solid #1e1e30; gap:8px; }
@@ -33,32 +30,27 @@ div[data-testid="stMetricValue"]    { color:#ddddf0 !important; }
 """, unsafe_allow_html=True)
 
 
-# ── DATA ─────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
+# ══════════════════════════════════════════════════════════════
+# DATA
+# ══════════════════════════════════════════════════════════════
+@st.cache_data(ttl=3601, show_spinner=False)
 def load_data(start="2014-01-01"):
     import time
-    end    = datetime.today().strftime("%Y-%m-%d")
-    # 최신 yfinance(0.2.40+)는 curl_cffi를 내부적으로 사용하므로
-    # 커스텀 세션을 주입하면 오히려 오류가 납니다. yfinance에 맡깁니다.
-    frames = {}
+    end, frames = datetime.today().strftime("%Y-%m-%d"), {}
     for col, sym in {"QQQ":"QQQ","SOXL":"SOXL","VIX":"^VIX","TNX":"^TNX"}.items():
         ok = False
-        # Ticker().history() — download()보다 안정적
         for attempt in range(3):
             try:
-                raw = yf.Ticker(sym).history(
-                    start=start, end=end, auto_adjust=True)
+                raw = yf.Ticker(sym).history(start=start, end=end, auto_adjust=True)
                 if not raw.empty:
                     s = raw["Close"]
                     frames[col] = s.squeeze() if isinstance(s, pd.DataFrame) else s
                     ok = True; break
             except Exception:
-                time.sleep(2 ** attempt)   # 1초 → 2초 → 4초 재시도
-        # 폴백: download()
+                time.sleep(2 ** attempt)
         if not ok:
             try:
-                raw = yf.download(sym, start=start, end=end,
-                                  progress=False, auto_adjust=True)
+                raw = yf.download(sym, start=start, end=end, progress=False, auto_adjust=True)
                 if not raw.empty:
                     s = raw["Close"]
                     frames[col] = s.squeeze() if isinstance(s, pd.DataFrame) else s
@@ -67,20 +59,23 @@ def load_data(start="2014-01-01"):
                 st.error(f"❌ {sym} 로드 실패: {e}\n새로고침(F5)하거나 잠시 후 다시 시도하세요.")
                 return None
         if not ok:
-            st.error(f"❌ {sym} 데이터를 가져올 수 없습니다. 네트워크를 확인하세요.")
-            return None
+            st.error(f"❌ {sym} 데이터를 가져올 수 없습니다."); return None
         time.sleep(0.5)
     df = pd.DataFrame(frames).ffill().dropna(subset=["QQQ","VIX"])
     df["SOXL"] = df["SOXL"].fillna(df["QQQ"])
     return df
 
 
-# ── SIGNALS ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# SIGNALS
+# ══════════════════════════════════════════════════════════════
 def compute_signals(df, vix_thresh=25.0, mom_days=20,
                     mom_thresh=2.0, tnx_days=60, tnx_thresh=5.0):
     d = df.copy()
     d["tnx_chg"]    = d["TNX"].pct_change(tnx_days) * 100
     d["qqq_mom"]    = d["QQQ"].pct_change(mom_days)  * 100
+    d["qqq_ma200"]  = d["QQQ"].rolling(200).mean()
+    d["above_ma200"]= d["QQQ"] > d["qqq_ma200"]
     d["f_market"]   = d["tnx_chg"]  < tnx_thresh
     d["f_momentum"] = d["qqq_mom"]  > mom_thresh
     d["f_vix"]      = d["VIX"]      > vix_thresh
@@ -89,67 +84,56 @@ def compute_signals(df, vix_thresh=25.0, mom_days=20,
     return d
 
 
-# ── BACKTEST ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# BACKTEST (numpy — 빠름)
+# ══════════════════════════════════════════════════════════════
 def run_backtest(df, initial=10_000_000, monthly=500_000, tx_cost=0.001):
-    # numpy 배열로 사전 추출 — iterrows() 대비 3~5배 빠름
-    idx     = df.index
-    n       = len(idx)
-    qp_a    = df["QQQ"].to_numpy(dtype=float)
-    sp_a    = df["SOXL"].to_numpy(dtype=float)
-    ent_a   = df["entry"].to_numpy(dtype=bool)
-    ex_a    = df["exit_sig"].to_numpy(dtype=bool)
-    vix_a   = df["VIX"].to_numpy(dtype=float)
-    mom_a   = df.get("qqq_mom", pd.Series(np.nan, index=idx)).to_numpy(dtype=float)
-    tnx_a   = df.get("tnx_chg", pd.Series(np.nan, index=idx)).to_numpy(dtype=float)
-
-    # 월 변경 마스크
-    m_arr   = np.array([d.month for d in idx])
-    m_chg   = np.zeros(n, dtype=bool)
-    m_chg[1:] = m_arr[1:] != m_arr[:-1]
+    idx   = df.index; n = len(idx)
+    qp_a  = df["QQQ"].to_numpy(dtype=float)
+    sp_a  = df["SOXL"].to_numpy(dtype=float)
+    ent_a = df["entry"].to_numpy(dtype=bool)
+    ex_a  = df["exit_sig"].to_numpy(dtype=bool)
+    vix_a = df["VIX"].to_numpy(dtype=float)
+    mom_a = df.get("qqq_mom", pd.Series(np.nan, index=idx)).to_numpy(dtype=float)
+    tnx_a = df.get("tnx_chg", pd.Series(np.nan, index=idx)).to_numpy(dtype=float)
+    m_arr = np.array([d.month for d in idx])
+    m_chg = np.zeros(n, dtype=bool); m_chg[1:] = m_arr[1:] != m_arr[:-1]
 
     o_qqq, o_soxl, in_soxl = initial/qp_a[0], 0.0, False
     b_qqq = initial/qp_a[0]
-
-    oracle_v  = np.empty(n);  dca_v    = np.empty(n)
-    insoxl_v  = np.empty(n, dtype=bool)
-    entry_v   = np.zeros(n,  dtype=bool)
-    exit_v    = np.zeros(n,  dtype=bool)
+    oracle_v = np.empty(n); dca_v = np.empty(n)
+    insoxl_v = np.empty(n, dtype=bool)
+    entry_v  = np.zeros(n, dtype=bool); exit_v = np.zeros(n, dtype=bool)
     trade_log = []
 
     for i in range(n):
         qp = qp_a[i]; sp = sp_a[i]
         if i > 0 and m_chg[i]:
-            if in_soxl:
-                o_qqq += (monthly*.5)/qp; o_soxl += (monthly*.5)/sp
-            else:
-                o_qqq += monthly/qp
-            b_qqq += monthly/qp
+            if in_soxl: o_qqq+=(monthly*.5)/qp; o_soxl+=(monthly*.5)/sp
+            else: o_qqq+=monthly/qp
+            b_qqq+=monthly/qp
         if i >= 1:
             if ent_a[i] and not in_soxl:
-                sw=o_qqq*qp*.5; o_qqq-=sw/qp; o_soxl=sw*(1-tx_cost)/sp; in_soxl=True
-                entry_v[i]=True
+                sw=o_qqq*qp*.5; o_qqq-=sw/qp; o_soxl=sw*(1-tx_cost)/sp; in_soxl=True; entry_v[i]=True
                 trade_log.append({"날짜":idx[i].date(),"액션":"QQQ→SOXL",
-                    "VIX":round(vix_a[i],1),
-                    "QQQ 모멘텀(%)":round(float(mom_a[i]),2),
+                    "VIX":round(vix_a[i],1),"QQQ 모멘텀(%)":round(float(mom_a[i]),2),
                     "TNX 변화율(%)":round(float(tnx_a[i]),2)})
             elif ex_a[i] and in_soxl:
-                sv=o_soxl*sp*(1-tx_cost); o_qqq+=sv/qp; o_soxl=0.0; in_soxl=False
-                exit_v[i]=True
+                sv=o_soxl*sp*(1-tx_cost); o_qqq+=sv/qp; o_soxl=0.0; in_soxl=False; exit_v[i]=True
                 trade_log.append({"날짜":idx[i].date(),"액션":"SOXL→QQQ",
-                    "VIX":round(vix_a[i],1),
-                    "QQQ 모멘텀(%)":round(float(mom_a[i]),2),
+                    "VIX":round(vix_a[i],1),"QQQ 모멘텀(%)":round(float(mom_a[i]),2),
                     "TNX 변화율(%)":round(float(tnx_a[i]),2)})
         oracle_v[i]=o_qqq*qp+o_soxl*sp; dca_v[i]=b_qqq*qp; insoxl_v[i]=in_soxl
 
-    results = pd.DataFrame({
-        "oracle":oracle_v, "dca":dca_v, "in_soxl":insoxl_v,
-        "entry":entry_v,   "exit_sig":exit_v,
-        "VIX":vix_a,       "qqq_mom":mom_a, "tnx_chg":tnx_a,
-    }, index=idx)
+    results = pd.DataFrame({"oracle":oracle_v,"dca":dca_v,"in_soxl":insoxl_v,
+        "entry":entry_v,"exit_sig":exit_v,"VIX":vix_a,"qqq_mom":mom_a,"tnx_chg":tnx_a},
+        index=idx)
     return results, pd.DataFrame(trade_log)
 
 
-# ── METRICS ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# METRICS
+# ══════════════════════════════════════════════════════════════
 def build_contributions(index, initial, monthly):
     c=pd.Series(0.0,index=index); c.iloc[0]=initial; prev=index[0].month
     for i,dt in enumerate(index[1:],1):
@@ -168,24 +152,30 @@ def calc_metrics(portfolio, contrib):
     return dict(total_invested=tv,final_value=fv,total_return=(fv/tv-1)*100,
                 cagr=cagr*100,mdd=mdd*100,sharpe=sh,years=yr,win_months=wr*100)
 
+def calc_annual_returns(portfolio):
+    """연도별 수익률 계산"""
+    yr = portfolio.resample("YE").last()
+    return (yr.pct_change().dropna() * 100).round(1)
 
-# ── WALK-FORWARD ─────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════
+# WALK-FORWARD
+# ══════════════════════════════════════════════════════════════
 def walk_forward_test(df_train, df_test, initial, monthly,
                       vix_range, mom_range, tnx_range):
     best_cagr, best_params, rows = -999, None, []
     combos = list(itertools.product(vix_range, mom_range, tnx_range))
     bar = st.progress(0, text=f"0 / {len(combos)} 조합 탐색 중...")
-    for idx, (v, m, t) in enumerate(combos):
+    for i, (v, m, t) in enumerate(combos):
         sig=compute_signals(df_train,v,20,m,60,t)
         bt,_=run_backtest(sig,initial,monthly)
         con=build_contributions(bt.index,initial,monthly)
         met=calc_metrics(bt["oracle"],con)
         rows.append({"VIX":v,"모멘텀(%)":m,"TNX 한도(%)":t,
-                     "학습 CAGR":round(met["cagr"],2),
-                     "학습 MDD":round(met["mdd"],2),
+                     "학습 CAGR":round(met["cagr"],2),"학습 MDD":round(met["mdd"],2),
                      "학습 샤프":round(met["sharpe"],2)})
         if met["cagr"]>best_cagr: best_cagr,best_params=met["cagr"],(v,m,t)
-        bar.progress((idx+1)/len(combos),text=f"{idx+1}/{len(combos)} 탐색 중...")
+        bar.progress((i+1)/len(combos), text=f"{i+1}/{len(combos)} 탐색 중...")
     bar.progress(100, text="탐색 완료!")
     bv,bm,bt_=best_params
     sig_tr=compute_signals(df_train,bv,20,bm,60,bt_)
@@ -203,12 +193,15 @@ def walk_forward_test(df_train, df_test, initial, monthly,
                 bt_te=bt_te,trades_te=tr_te,con_te=con_te)
 
 
-# ── FORMAT ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# FORMAT & PLOT CONSTANTS
+# ══════════════════════════════════════════════════════════════
 def fmt(v):
     if v>=100_000_000: return f"{v/100_000_000:,.1f}억원"
     if v>=10_000: return f"{v/10_000:,.0f}만원"
     return f"{v:,.0f}원"
 def fmt_full(v): return f"{v:,.0f}원"
+def pct_color(v): return "#22c55e" if v >= 0 else "#f87171"
 
 AX  = dict(gridcolor="#151520", showgrid=True, zeroline=False)
 LAY = dict(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(8,8,15,0.95)",
@@ -216,7 +209,9 @@ LAY = dict(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(8,8,15,0.95)",
            margin=dict(l=60,r=20,t=30,b=40), hovermode="x unified")
 
 
-# ── SIDEBAR ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("## ⚙️ 파라미터 조정")
     st.markdown("#### 💰 투자 설정")
@@ -234,13 +229,13 @@ with st.sidebar:
     st.caption("📌 개인 교육용 도구 | 과거 수익률은 미래를 보장하지 않습니다.")
 
 
-# ── PIPELINE CACHE ───────────────────────────────────────────
-# 파라미터가 같으면 재계산 없이 즉시 반환 (슬라이더 반응 속도 핵심)
+# ══════════════════════════════════════════════════════════════
+# PIPELINE CACHE
+# ══════════════════════════════════════════════════════════════
 @st.cache_data(show_spinner=False)
 def run_pipeline(vix_t, mom_t, tnx_t, initial_cap, monthly_inv):
-    raw = load_data("2014-01-01")   # load_data 자체도 캐시됨
-    if raw is None:
-        return None
+    raw = load_data("2014-01-01")
+    if raw is None: return None
     sig    = compute_signals(raw, vix_t, 20, mom_t, 60, tnx_t)
     bt, tr = run_backtest(sig, initial_cap, monthly_inv)
     con    = build_contributions(bt.index, initial_cap, monthly_inv)
@@ -251,9 +246,11 @@ def run_pipeline(vix_t, mom_t, tnx_t, initial_cap, monthly_inv):
     return raw, sig, bt, tr, con, om, dm, qc
 
 
-# ── LOAD & COMPUTE ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# LOAD
+# ══════════════════════════════════════════════════════════════
 st.markdown("# 🔮 나스닥 하이브리드 오라클 전략")
-st.markdown("QQQ ↔ SOXL 스위칭 전략 | 10년 백테스트 검증 대시보드 · 개인 교육용")
+st.markdown("QQQ ↔ SOXL 스위칭 전략 | 10년 백테스트 + 실시간 시장 참고 대시보드 · 개인 교육용")
 
 with st.spinner("📡 데이터 로딩 중..."):
     result = run_pipeline(vix_t, mom_t, tnx_t, initial_cap, monthly_inv)
@@ -262,32 +259,36 @@ if result is None: st.stop()
 raw, sig_df, bt, trades, contrib, om, dm, qqq_cagr = result
 
 
-# ── TABS ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# TABS
+# ══════════════════════════════════════════════════════════════
 tab1, tab2, tab3, tab4 = st.tabs([
-    "📈 백테스트 결과", "🎯 현재 시장 상태", "🚀 시뮬레이터", "🔬 과적합 검증"])
+    "📈 백테스트 결과", "📊 지금 시장 상태", "🚀 시뮬레이터", "🔬 과적합 검증"])
 
 
-# ════════════════════════════════════════════════════════
-# TAB 1
-# ════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
+# TAB 1 — 백테스트 결과
+# ════════════════════════════════════════════════════════════
 with tab1:
-    gap  = om["cagr"]-dm["cagr"]
-    tv   = om["total_invested"]
-    yrs  = om["years"]
+    gap = om["cagr"] - dm["cagr"]
+    tv  = om["total_invested"]
+    yrs = om["years"]
 
-    with st.expander("📖 이 전략이 뭔가요? (클릭해서 보기)"):
+    with st.expander("📖 오라클 전략이란?"):
         st.markdown(f"""
-**오라클 전략** — 평소엔 QQQ 적립, 공황 반등 시점에 **SOXL 50% 스위칭**
+평소엔 QQQ를 적립하다가, 공황 직후 반등 순간을 포착해 **SOXL(반도체 3배 레버리지)로 50% 스위칭**하는 전략
 
-| 조건 | 현재 기준 | 의미 |
+| 진입 조건 | 현재 임계값 | 의미 |
 |---|---|---|
-| 🔴 VIX | {vix_t} 이상 | 시장이 충분히 겁먹은 상태 |
-| 🟢 QQQ 20일 수익률 | {mom_t}% 이상 | 바닥 치고 회복 시작 |
-| 🟡 금리 안정 | 60일 변화율 {tnx_t}% 미만 | 유동성 안전 |
+| 🔴 VIX 공포지수 | {vix_t} 이상 | 시장이 충분히 패닉 상태 |
+| 🟢 QQQ 20일 수익률 | {mom_t}% 이상 | 바닥 찍고 반등 시작 확인 |
+| 🟡 10년물 금리 안정 | 60일 변화율 {tnx_t}% 미만 | 금리 충격 없어 유동성 OK |
 
-QQQ 20일 수익률이 **0% 아래**로 떨어지면 → SOXL 전량 QQQ 복귀
+**청산:** QQQ 20일 수익률이 0% 아래로 → 추세 꺾임 판단, SOXL 전량 QQQ 복귀  
+**주의:** SOXL은 3배 레버리지라 손실도 3배, 장기 보유 시 변동성 잠식 발생
         """)
 
+    # 검증 배너
     if om["cagr"] >= 22*0.90:
         st.success(f"✅ 주장된 22% CAGR → 백테스트 실측 **{om['cagr']:.1f}%** 재현")
     elif om["cagr"] > dm["cagr"]:
@@ -296,57 +297,45 @@ QQQ 20일 수익률이 **0% 아래**로 떨어지면 → SOXL 전량 QQQ 복귀
         st.error(f"❌ 현재 파라미터 CAGR **{om['cagr']:.1f}%** < QQQ 적립 {dm['cagr']:.1f}%")
 
     st.markdown("---")
-    st.markdown("### 💡 쉽게 말하면 이렇습니다")
-    st.markdown(f"{int(yrs)}년간 **{fmt(initial_cap)}** 투자 + 매달 **{fmt(monthly_inv)}** 적립 (총 투입금 **{fmt(tv)}**)")
 
-    co, cd, cdiff = st.columns(3)
-    with co:
+    # ── 핵심 결과 카드 ─────────────────────────────────────
+    st.markdown("### 💡 핵심 성과 요약")
+    st.caption(f"{int(yrs)}년간 **{fmt(initial_cap)}** 투자 + 매달 **{fmt(monthly_inv)}** 적립 (총 투입금 **{fmt(tv)}**)")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
         st.markdown(f"""<div style="background:#0f1f16;border:1px solid #22c55e44;border-radius:12px;padding:1.2rem;text-align:center">
           <div style="font-size:12px;color:#6b7280;margin-bottom:6px">🔮 오라클 전략</div>
           <div style="font-size:28px;font-weight:700;color:#22c55e">{fmt(om['final_value'])}</div>
-          <div style="font-size:13px;color:#9ca3af;margin-top:4px">내 돈의 {om['final_value']/tv:.1f}배</div>
-          <div style="font-size:12px;color:#4ade80;margin-top:2px">연평균 {om['cagr']:.1f}% 복리</div>
+          <div style="font-size:13px;color:#9ca3af;margin-top:4px">투입금의 {om['final_value']/tv:.1f}배</div>
+          <div style="font-size:12px;color:#4ade80;margin-top:2px">연평균 {om['cagr']:.1f}% · MDD {om['mdd']:.1f}%</div>
         </div>""", unsafe_allow_html=True)
-    with cd:
+    with c2:
         st.markdown(f"""<div style="background:#111827;border:1px solid #374151;border-radius:12px;padding:1.2rem;text-align:center">
           <div style="font-size:12px;color:#6b7280;margin-bottom:6px">📊 QQQ 그냥 적립</div>
           <div style="font-size:28px;font-weight:700;color:#9ca3af">{fmt(dm['final_value'])}</div>
-          <div style="font-size:13px;color:#9ca3af;margin-top:4px">내 돈의 {dm['final_value']/tv:.1f}배</div>
-          <div style="font-size:12px;color:#6b7280;margin-top:2px">연평균 {dm['cagr']:.1f}% 복리</div>
+          <div style="font-size:13px;color:#9ca3af;margin-top:4px">투입금의 {dm['final_value']/tv:.1f}배</div>
+          <div style="font-size:12px;color:#6b7280;margin-top:2px">연평균 {dm['cagr']:.1f}% · MDD {dm['mdd']:.1f}%</div>
         </div>""", unsafe_allow_html=True)
-    with cdiff:
-        extra=om["final_value"]-dm["final_value"]
-        sc="#22c55e" if extra>=0 else "#f87171"
+    with c3:
+        extra = om["final_value"] - dm["final_value"]
+        sc = "#22c55e" if extra >= 0 else "#f87171"
         st.markdown(f"""<div style="background:#0f0f1a;border:1px solid #6366f144;border-radius:12px;padding:1.2rem;text-align:center">
           <div style="font-size:12px;color:#6b7280;margin-bottom:6px">📐 전략 초과 수익</div>
           <div style="font-size:28px;font-weight:700;color:{sc}">{fmt(abs(extra))}</div>
           <div style="font-size:13px;color:#9ca3af;margin-top:4px">{'더' if extra>=0 else '덜'} 벌었습니다</div>
-          <div style="font-size:12px;color:#6366f1;margin-top:2px">스위칭 {len(trades)}회 (비용 0.1%)</div>
+          <div style="font-size:12px;color:#6366f1;margin-top:2px">스위칭 {len(trades)}회 · 비용 0.1%</div>
         </div>""", unsafe_allow_html=True)
 
+    # ── 수익률 비교 바 ─────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
-    with st.expander("📊 연평균 수익률(CAGR)이 뭔지 모르겠어요"):
-        st.markdown("""
-**CAGR = 내 돈이 매년 평균 몇 %씩 불었나**
-
-예: 1,000만원 → 10년 뒤 2,593만원 = CAGR **10%**
-은행 예금 3.5% 대비, CAGR 13%는 **약 3.7배** 더 빠르게 불어납니다.
-
----
-**왜 "QQQ 주가가 연 18% 올랐다"는데 내 수익률은 낮게 나오나요?**
-
-매달 조금씩 넣으면 마지막에 넣은 돈은 1달밖에 못 굴립니다.
-10년 전 돈은 18%를 10번, 1년 전 돈은 1번만 받습니다.
-DCA CAGR이 가격 CAGR보다 낮은 건 **정상**입니다.
-        """)
-
     mrows = [
-        ("📈 QQQ 주가 상승률", qqq_cagr, "#818cf8", "주가 자체 상승 (적립과 무관)"),
-        ("🔮 오라클 연평균",   om["cagr"],"#22c55e", f"적립 + 전략 | MDD {om['mdd']:.1f}%"),
-        ("📊 QQQ 그냥 적립",   dm["cagr"],"#6b7280", f"매달 QQQ만 삼 | MDD {dm['mdd']:.1f}%"),
-        ("🏦 정기예금 (참고)", 3.5,       "#374151", "위험 없는 기준선"),
+        ("📈 QQQ 주가 상승률", qqq_cagr, "#818cf8", "주가 자체 상승률 (적립과 무관 — 뉴스에서 말하는 수치)"),
+        ("🔮 오라클 연평균",   om["cagr"], "#22c55e", f"DCA + 스위칭 전략 적용 | 최대 낙폭 {om['mdd']:.1f}%"),
+        ("📊 QQQ 그냥 적립",   dm["cagr"], "#6b7280", f"매달 QQQ만 사고 아무것도 안 함 | 최대 낙폭 {dm['mdd']:.1f}%"),
+        ("🏦 정기예금 기준선", 3.5,        "#374151", "무위험 기준 (위험 없는 최소 기준)"),
     ]
-    mx = max(m[1] for m in mrows)*1.15
+    mx = max(m[1] for m in mrows) * 1.15
     for label, val, color, note in mrows:
         st.markdown(f"""
         <div style="margin-bottom:14px">
@@ -360,239 +349,511 @@ DCA CAGR이 가격 CAGR보다 낮은 건 **정상**입니다.
           <div style="font-size:11px;color:#3e3e56">{note}</div>
         </div>""", unsafe_allow_html=True)
 
+    with st.expander("📊 DCA CAGR이 QQQ 주가 상승률보다 낮게 나오는 이유"):
+        st.markdown(f"""
+**QQQ 주가 CAGR {qqq_cagr:.1f}%** vs **DCA CAGR {dm['cagr']:.1f}%** — 왜 차이가 날까요?
+
+매달 적립하면 **나중에 넣은 돈은 굴릴 시간이 짧습니다.**  
+10년 전에 넣은 돈은 {qqq_cagr:.1f}%를 10번 받지만, 1년 전에 넣은 돈은 1번만 받습니다.  
+전체를 평균 내면 약 절반 수준이 됩니다. **잘못된 게 아니라 DCA의 정상적인 특성입니다.**
+        """)
+
+    # ── MDD 설명 ───────────────────────────────────────────
     st.markdown(f"""
     <div style="background:#1a1010;border:0.5px solid #f8717133;border-radius:10px;padding:1rem 1.2rem;margin:8px 0">
       <div style="color:#f87171;font-size:13px;font-weight:600;margin-bottom:6px">📉 MDD(최대 낙폭) — 투자 중 가장 많이 떨어진 순간</div>
       <div style="color:#9ca3af;font-size:13px">
-        오라클 MDD <b style="color:#f87171">{om['mdd']:.1f}%</b> &nbsp;·&nbsp; QQQ 적립 MDD <b style="color:#fbbf24">{dm['mdd']:.1f}%</b>
+        오라클 MDD <b style="color:#f87171">{om['mdd']:.1f}%</b>
+        &nbsp;·&nbsp; QQQ 적립 MDD <b style="color:#fbbf24">{dm['mdd']:.1f}%</b>
       </div>
       <div style="color:#6b7280;font-size:12px;margin-top:4px">
-        오라클 전략은 최악의 순간 전고점 대비 {abs(om['mdd']):.0f}%까지 빠졌습니다.
-        1,000만원이 {1000*(1+om['mdd']/100):.0f}만원이 됐던 순간입니다.
+        오라클 전략 기준, 최악의 순간 전고점 대비 {abs(om['mdd']):.0f}%까지 빠졌습니다.
+        1,000만원이 {1000*(1+om['mdd']/100):.0f}만원이 됐던 순간이 있다는 뜻입니다.
+        이 구간을 버텨낼 심리적 준비가 필요합니다.
       </div>
     </div>""", unsafe_allow_html=True)
 
-    with st.expander("💡 이 전략보다 좋은 전략이 있나요?"):
-        st.markdown("""
-| 전략 | 기대 수익 | MDD | 복잡도 |
-|---|---|---|---|
-| 오라클 (현 전략) | 높음 | 높음 | 복잡 |
-| **200MA 필터** ⭐⭐⭐⭐ | 중간 | **낮음** | 단순 |
-| **듀얼 모멘텀** ⭐⭐⭐⭐ | 중간 | **낮음** | 단순 |
-| 올웨더 ⭐⭐⭐ | 낮음 | 매우 낮음 | 단순 |
-
-**200MA 필터**: QQQ가 200일선 위면 보유, 아래면 현금. 2008·2022 큰 하락 회피.
-**듀얼 모멘텀**: 매달 QQQ vs 채권 12개월 수익률 비교해서 높은 쪽 투자. 학술 검증 완료.
-**올웨더**: 주식30%·장기채40%·중기채15%·금7.5%·원자재7.5%. MDD 매우 낮음.
-
-수익보다 심리적 안정이 중요하다면 듀얼 모멘텀이나 200MA 필터가 더 현실적입니다.
-        """)
-
     st.markdown("---")
-    st.markdown("### 📈 누적 자산 변화 (2014 → 현재)")
+
+    # ── 누적 자산 차트 ─────────────────────────────────────
+    st.markdown("### 📈 누적 자산 변화")
     fig = go.Figure()
-    soxl_flag=bt["in_soxl"].astype(int); trans=soxl_flag.diff().fillna(0)
-    ss=bt.index[trans==1].tolist(); se=bt.index[trans==-1].tolist()
-    if len(ss)>len(se): se.append(bt.index[-1])
-    for s,e in zip(ss,se):
-        fig.add_vrect(x0=s,x1=e,fillcolor="#6366f1",opacity=0.07,line_width=0,
-                      annotation_text="SOXL" if (e-s).days>5 else "",
-                      annotation_font_color="#6366f1",annotation_font_size=9)
-    fig.add_trace(go.Scatter(x=bt.index,y=contrib,name="누적 투입금",
-        line=dict(color="#2d2d4a",width=1.5,dash="dot"),
-        fill="tozeroy",fillcolor="rgba(45,45,74,0.15)"))
-    fig.add_trace(go.Scatter(x=bt.index,y=bt["dca"],name="QQQ DCA",
-        line=dict(color="#6b7280",width=2,dash="dash")))
-    fig.add_trace(go.Scatter(x=bt.index,y=bt["oracle"],name="오라클 전략",
-        line=dict(color="#818cf8",width=2.5)))
-    en=bt[bt["entry"]==True]; ex=bt[bt["exit_sig"]==True]
-    fig.add_trace(go.Scatter(x=en.index,y=en["oracle"],mode="markers",name="SOXL 진입",
-        marker=dict(color="#22c55e",size=9,symbol="triangle-up",line=dict(color="white",width=1))))
-    fig.add_trace(go.Scatter(x=ex.index,y=ex["oracle"],mode="markers",name="QQQ 복귀",
-        marker=dict(color="#f87171",size=7,symbol="triangle-down",line=dict(color="white",width=1))))
-    fig.update_layout(**LAY,height=460,xaxis=dict(**AX),
-        yaxis=dict(**AX,title="포트폴리오 (원)",tickformat=",.0f"),
-        legend=dict(bgcolor="rgba(10,10,20,0.85)",bordercolor="#2a2a3a",borderwidth=1))
+    soxl_flag = bt["in_soxl"].astype(int)
+    trans = soxl_flag.diff().fillna(0)
+    ss = bt.index[trans==1].tolist(); se = bt.index[trans==-1].tolist()
+    if len(ss) > len(se): se.append(bt.index[-1])
+    for s, e in zip(ss, se):
+        fig.add_vrect(x0=s, x1=e, fillcolor="#6366f1", opacity=0.07, line_width=0,
+                      annotation_text="SOXL 보유" if (e-s).days > 30 else "",
+                      annotation_font_color="#6366f1", annotation_font_size=9)
+    fig.add_trace(go.Scatter(x=bt.index, y=contrib, name="누적 투입금",
+        line=dict(color="#2d2d4a", width=1.5, dash="dot"),
+        fill="tozeroy", fillcolor="rgba(45,45,74,0.15)"))
+    fig.add_trace(go.Scatter(x=bt.index, y=bt["dca"], name="QQQ 적립",
+        line=dict(color="#6b7280", width=2, dash="dash")))
+    fig.add_trace(go.Scatter(x=bt.index, y=bt["oracle"], name="오라클 전략",
+        line=dict(color="#818cf8", width=2.5)))
+    en = bt[bt["entry"]==True]; ex = bt[bt["exit_sig"]==True]
+    fig.add_trace(go.Scatter(x=en.index, y=en["oracle"], mode="markers", name="SOXL 진입",
+        marker=dict(color="#22c55e", size=9, symbol="triangle-up", line=dict(color="white", width=1))))
+    fig.add_trace(go.Scatter(x=ex.index, y=ex["oracle"], mode="markers", name="QQQ 복귀",
+        marker=dict(color="#f87171", size=7, symbol="triangle-down", line=dict(color="white", width=1))))
+    fig.update_layout(**LAY, height=460, xaxis=dict(**AX),
+        yaxis=dict(**AX, title="포트폴리오 (원)", tickformat=",.0f"),
+        legend=dict(bgcolor="rgba(10,10,20,0.85)", bordercolor="#2a2a3a", borderwidth=1))
     st.plotly_chart(fig, use_container_width=True)
 
+    # ── 연도별 성과 테이블 ─────────────────────────────────
+    st.markdown("### 📅 연도별 성과 비교")
+    st.caption("각 연도에 오라클 전략과 QQQ 단순 적립이 얼마나 수익/손실을 냈는지 한눈에 볼 수 있습니다.")
+
+    ann_o = calc_annual_returns(bt["oracle"])
+    ann_d = calc_annual_returns(bt["dca"])
+    ann_v = sig_df["VIX"].resample("YE").mean().round(1)
+
+    ann_df = pd.DataFrame({
+        "연도": [str(y.year) for y in ann_o.index],
+        "오라클 (%)": ann_o.values,
+        "QQQ 적립 (%)": ann_d.reindex(ann_o.index).values,
+        "평균 VIX": ann_v.reindex(ann_o.index).values,
+    }).set_index("연도")
+    ann_df["초과 수익 (%p)"] = (ann_df["오라클 (%)"] - ann_df["QQQ 적립 (%)"]).round(1)
+
+    def color_ret(val):
+        if pd.isna(val): return ""
+        color = "#22c55e" if val > 0 else "#f87171"
+        return f"color: {color}; font-weight: 600"
+    def color_excess(val):
+        if pd.isna(val): return ""
+        color = "#818cf8" if val > 0 else "#f87171"
+        return f"color: {color}"
+
+    styled = (ann_df.style
+        .map(color_ret, subset=["오라클 (%)","QQQ 적립 (%)"])
+        .map(color_excess, subset=["초과 수익 (%p)"])
+        .format({"오라클 (%)":"{:.1f}%","QQQ 적립 (%)":"{:.1f}%",
+                 "평균 VIX":"{:.1f}","초과 수익 (%p)":"{:+.1f}%p"}, na_rep="—"))
+    st.dataframe(styled, use_container_width=True)
+
+    # 연도별 바 차트
+    fig_ann = go.Figure()
+    fig_ann.add_trace(go.Bar(x=ann_df.index, y=ann_df["QQQ 적립 (%)"], name="QQQ 적립",
+        marker_color=["#22c55e" if v>0 else "#f87171" for v in ann_df["QQQ 적립 (%)"]],
+        opacity=0.5))
+    fig_ann.add_trace(go.Bar(x=ann_df.index, y=ann_df["오라클 (%)"], name="오라클",
+        marker_color=["#818cf8" if v>0 else "#f04040" for v in ann_df["오라클 (%)"]],
+        opacity=0.85))
+    fig_ann.add_hline(y=0, line=dict(color="#374151", width=1))
+    fig_ann.update_layout(**LAY, height=300, barmode="group",
+        xaxis=dict(**AX), yaxis=dict(**AX, title="연간 수익률 (%)"),
+        legend=dict(bgcolor="rgba(10,10,20,0.85)", bordercolor="#2a2a3a", borderwidth=1),
+        margin=dict(l=60, r=20, t=20, b=40))
+    st.plotly_chart(fig_ann, use_container_width=True)
+
+    # ── 낙폭 차트 ──────────────────────────────────────────
     with st.expander("📉 낙폭(Drawdown) 비교 차트"):
-        ddo=(bt["oracle"]-bt["oracle"].cummax())/bt["oracle"].cummax()*100
-        ddd=(bt["dca"]-bt["dca"].cummax())/bt["dca"].cummax()*100
-        fdd=go.Figure()
-        fdd.add_trace(go.Scatter(x=bt.index,y=ddd,name="QQQ DCA",
-            line=dict(color="#6b7280",width=1.5),fill="tozeroy",fillcolor="rgba(107,114,128,0.1)"))
-        fdd.add_trace(go.Scatter(x=bt.index,y=ddo,name="오라클",
-            line=dict(color="#818cf8",width=2),fill="tozeroy",fillcolor="rgba(129,140,248,0.1)"))
-        fdd.update_layout(**LAY,height=280,xaxis=dict(**AX),yaxis=dict(**AX,title="낙폭 (%)"))
+        ddo = (bt["oracle"]-bt["oracle"].cummax())/bt["oracle"].cummax()*100
+        ddd = (bt["dca"]-bt["dca"].cummax())/bt["dca"].cummax()*100
+        fdd = go.Figure()
+        fdd.add_trace(go.Scatter(x=bt.index, y=ddd, name="QQQ 적립",
+            line=dict(color="#6b7280", width=1.5), fill="tozeroy", fillcolor="rgba(107,114,128,0.1)"))
+        fdd.add_trace(go.Scatter(x=bt.index, y=ddo, name="오라클",
+            line=dict(color="#818cf8", width=2), fill="tozeroy", fillcolor="rgba(129,140,248,0.1)"))
+        fdd.update_layout(**LAY, height=280, xaxis=dict(**AX), yaxis=dict(**AX, title="낙폭 (%)"))
         st.plotly_chart(fdd, use_container_width=True)
 
+    # ── 스위칭 이력 ───────────────────────────────────────
     st.markdown("### 🔔 스위칭 이력")
     if trades.empty:
         st.info("현재 파라미터에서 신호가 발생하지 않았습니다.")
     else:
-        ca,cb=st.columns([3,1])
+        ca, cb = st.columns([3, 1])
         with ca:
             def ca_fn(v):
-                if v=="QQQ→SOXL": return "color:#22c55e;font-weight:600"
-                if v=="SOXL→QQQ": return "color:#f87171;font-weight:600"
+                if v == "QQQ→SOXL": return "color:#22c55e;font-weight:600"
+                if v == "SOXL→QQQ": return "color:#f87171;font-weight:600"
                 return ""
-            st.dataframe(trades.style.map(ca_fn,subset=["액션"]),
-                         use_container_width=True,height=300)
+            st.dataframe(trades.style.map(ca_fn, subset=["액션"]),
+                         use_container_width=True, height=300)
         with cb:
-            ne=(trades["액션"]=="QQQ→SOXL").sum()
-            av=trades.loc[trades["액션"]=="QQQ→SOXL","VIX"].mean()
-            st.metric("SOXL 진입 횟수",f"{ne}회")
-            st.metric("QQQ 복귀 횟수",f"{(trades['액션']=='SOXL→QQQ').sum()}회")
-            if not np.isnan(av): st.metric("진입 시 평균 VIX",f"{av:.1f}")
+            ne = (trades["액션"]=="QQQ→SOXL").sum()
+            av = trades.loc[trades["액션"]=="QQQ→SOXL","VIX"].mean()
+            st.metric("SOXL 진입", f"{ne}회")
+            st.metric("QQQ 복귀",  f"{(trades['액션']=='SOXL→QQQ').sum()}회")
+            if not np.isnan(av): st.metric("진입 시 평균 VIX", f"{av:.1f}")
+
+    with st.expander("💡 이 전략보다 좋은 전략이 있나요?"):
+        st.markdown("""
+| 전략 | 수익 | MDD | 복잡도 | 핵심 룰 |
+|---|---|---|---|---|
+| 오라클 (현 전략) | 높음 | 높음 | 복잡 | VIX+모멘텀+금리 3조건 |
+| **200MA 필터** ⭐⭐⭐⭐ | 중간 | 낮음 | 단순 | QQQ가 200일선 위면 보유, 아래면 현금 |
+| **듀얼 모멘텀** ⭐⭐⭐⭐ | 중간 | 낮음 | 단순 | 매달 QQQ vs 채권 12개월 수익률 비교 |
+| 올웨더 ⭐⭐⭐ | 낮음 | 매우 낮음 | 단순 | 주식30·장기채40·금7.5·원자재7.5 |
+
+수익보다 심리적 안정이 중요하다면 **듀얼 모멘텀**이 가장 현실적입니다. 학술 논문으로 검증됐고 룰이 단순합니다.
+        """)
 
     st.info("**📌 백테스트 주의사항**  \n"
             "① 과거 수익률은 미래를 보장하지 않습니다  \n"
-            "② 파라미터 최적화 → Overfitting 위험  \n"
+            "② 파라미터 최적화 → Overfitting 위험 (탭4 과적합 검증 활용)  \n"
             "③ 세금(22%)·환전비용·슬리피지 미반영  \n"
             "④ SOXL 3× 레버리지 — 장기 보유 시 변동성 잠식 주의")
 
 
-# ════════════════════════════════════════════════════════
-# TAB 2
-# ════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
+# TAB 2 — 지금 시장 상태 (투자 참고 핵심 탭)
+# ════════════════════════════════════════════════════════════
 with tab2:
-    latest=sig_df.iloc[-1]; ld=sig_df.index[-1]
-    cvix=float(latest["VIX"])
-    cmom=float(latest.get("qqq_mom",np.nan))
-    ctnx=float(latest.get("tnx_chg",np.nan))
-    fm=bool(latest.get("f_market",False))
-    fmo=bool(latest.get("f_momentum",False))
-    fv=bool(latest.get("f_vix",False))
-    nok=sum([fm,fmo,fv])
-    if nok==3:   state,cs="🚀 가속 (SOXL 스위칭 시점)","#22c55e"; adv="모든 조건 충족 — SOXL 50% 스위칭 시점입니다."
-    elif nok>=1: state,cs="⏳ 적립 대기","#fbbf24"; adv=f"{3-nok}개 조건 미충족 — QQQ DCA 유지하며 기다립니다."
-    else:        state,cs="🛡️ 안전 모드 (DCA)","#6366f1"; adv="신호 없음 — 일반 QQQ 적립을 유지하세요."
+    latest    = sig_df.iloc[-1]
+    ld        = sig_df.index[-1]
+    raw_last  = raw.iloc[-1]
 
-    cg,cf=st.columns(2)
-    with cg:
-        fg=go.Figure(go.Indicator(mode="gauge+number",value=nok,
-            title={"text":f"<b>{state}</b>","font":{"color":cs,"size":15}},
-            number={"suffix":" / 3 조건","font":{"color":"#ddddf0","size":28}},
-            gauge={"axis":{"range":[0,3],"tickcolor":"#6b7280"},
-                   "bar":{"color":cs,"thickness":0.28},"bgcolor":"#10101e","borderwidth":0,
-                   "steps":[{"range":[0,3],"color":"#141426"}],
-                   "threshold":{"line":{"color":cs,"width":4},"thickness":0.8,"value":nok}}))
-        fg.update_layout(paper_bgcolor="rgba(0,0,0,0)",font=dict(color="#9ca3af"),
-                         height=260,margin=dict(l=20,r=20,t=40,b=10))
-        st.plotly_chart(fg, use_container_width=True)
-        st.caption(f"기준: {ld.strftime('%Y년 %m월 %d일')}")
-    with cf:
-        def fcard(label,val_str,ok,note):
-            ic="✅" if ok else "❌"; bc="#22c55e33" if ok else "#f8717122"; vc="#22c55e" if ok else "#f87171"
-            return (f'<div style="background:#10101e;border:0.5px solid {bc};border-radius:10px;padding:12px 16px;margin-bottom:8px">'
-                    f'<div style="display:flex;justify-content:space-between;align-items:center">'
-                    f'<span style="color:#ddddf0;font-size:14px;font-weight:500">{ic} {label}</span>'
-                    f'<span style="color:{vc};font-family:monospace;font-size:18px;font-weight:600">{val_str}</span>'
-                    f'</div><div style="font-size:11px;color:#5a5a7a;margin-top:3px">{note}</div></div>')
-        vs=f"{cvix:.1f}" if not np.isnan(cvix) else "N/A"
-        ms=f"{cmom:+.1f}%" if not np.isnan(cmom) else "N/A"
-        ts=f"{ctnx:+.1f}%" if not np.isnan(ctnx) else "N/A"
-        st.markdown(
-            fcard("VIX 공포지수",vs,fv,f"임계값 {vix_t} 이상 → {'✔ 충족' if fv else '✘ 미충족'}")+
-            fcard("QQQ 20일 모멘텀",ms,fmo,f"20일 수익률 {mom_t}% 이상 → {'✔ 충족' if fmo else '✘ 미충족'}")+
-            fcard("TNX 60일 변화율",ts,fm,f"금리 변화율 {tnx_t}% 미만 → {'✔ 충족' if fm else '✘ 미충족'}"),
-            unsafe_allow_html=True)
-        st.markdown(f'<div style="background:#10101e;border:0.5px solid {cs}44;border-radius:10px;padding:12px 16px;color:{cs};font-size:14px">💬 {adv}</div>',unsafe_allow_html=True)
+    # 현재 & 변화율 계산
+    qqq_now   = float(raw["QQQ"].iloc[-1])
+    qqq_1d    = (raw["QQQ"].iloc[-1]/raw["QQQ"].iloc[-2]-1)*100  if len(raw)>1  else 0
+    qqq_1w    = (raw["QQQ"].iloc[-1]/raw["QQQ"].iloc[-6]-1)*100  if len(raw)>5  else 0
+    qqq_1m    = (raw["QQQ"].iloc[-1]/raw["QQQ"].iloc[-22]-1)*100 if len(raw)>21 else 0
+    qqq_3m    = (raw["QQQ"].iloc[-1]/raw["QQQ"].iloc[-66]-1)*100 if len(raw)>65 else 0
+    qqq_ytd   = (raw["QQQ"].iloc[-1]/raw["QQQ"][raw.index.year==ld.year].iloc[0]-1)*100
+
+    soxl_now  = float(raw["SOXL"].iloc[-1])
+    soxl_1d   = (raw["SOXL"].iloc[-1]/raw["SOXL"].iloc[-2]-1)*100 if len(raw)>1 else 0
+
+    vix_now   = float(raw["VIX"].iloc[-1])
+    tnx_now   = float(raw["TNX"].iloc[-1])
+
+    # 200일선 관련
+    ma200     = sig_df["qqq_ma200"].iloc[-1]
+    ma200_gap = (qqq_now / ma200 - 1) * 100 if not np.isnan(ma200) else 0
+    above_ma  = qqq_now > ma200
+
+    # VIX 역사적 퍼센타일
+    vix_pct   = (raw["VIX"] <= vix_now).mean() * 100
+
+    # QQQ 52주 고저
+    qqq_52h   = raw["QQQ"].iloc[-252:].max() if len(raw)>=252 else raw["QQQ"].max()
+    qqq_52l   = raw["QQQ"].iloc[-252:].min() if len(raw)>=252 else raw["QQQ"].min()
+    qqq_52pos = (qqq_now - qqq_52l) / (qqq_52h - qqq_52l) * 100
+
+    # 신호
+    cvix = float(latest["VIX"])
+    cmom = float(latest.get("qqq_mom", np.nan))
+    ctnx = float(latest.get("tnx_chg", np.nan))
+    fm   = bool(latest.get("f_market",   False))
+    fmo  = bool(latest.get("f_momentum", False))
+    fv   = bool(latest.get("f_vix",      False))
+    nok  = sum([fm, fmo, fv])
+
+    if nok == 3:   state, cs = "🚀 SOXL 스위칭 시점", "#22c55e"; adv = "모든 조건 충족 — 오라클 전략 기준 SOXL 50% 스위칭 시점입니다."
+    elif nok >= 1: state, cs = "⏳ 적립 대기 중",     "#fbbf24"; adv = f"{3-nok}개 조건 미충족 — QQQ 적립을 유지하며 신호를 기다립니다."
+    else:          state, cs = "🛡️ QQQ 적립 모드",   "#6366f1"; adv = "신호 없음 — QQQ 정기 적립만 유지하세요."
+
+    st.caption(f"마지막 업데이트: {ld.strftime('%Y년 %m월 %d일')} (1시간 캐시)")
+
+    # ── 현재 가격 스냅샷 ───────────────────────────────────
+    st.markdown("### 💹 현재 시장 스냅샷")
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("QQQ",     f"${qqq_now:,.2f}",  f"{qqq_1d:+.2f}% (1일)")
+    p2.metric("SOXL",    f"${soxl_now:,.2f}", f"{soxl_1d:+.2f}% (1일)")
+    p3.metric("VIX",     f"{vix_now:.1f}",    f"역사적 {vix_pct:.0f} 퍼센타일")
+    p4.metric("TNX (10년물)", f"{tnx_now:.2f}%", f"{ctnx:+.1f}% (60일 변화)")
+
+    # ── QQQ 단기 성과 ──────────────────────────────────────
+    st.markdown("#### QQQ 기간별 수익률")
+    r1, r2, r3, r4, r5 = st.columns(5)
+    r1.metric("1일",  f"{qqq_1d:+.1f}%",  delta_color="normal" if qqq_1d>=0 else "inverse")
+    r2.metric("1주",  f"{qqq_1w:+.1f}%",  delta_color="normal" if qqq_1w>=0 else "inverse")
+    r3.metric("1개월", f"{qqq_1m:+.1f}%", delta_color="normal" if qqq_1m>=0 else "inverse")
+    r4.metric("3개월", f"{qqq_3m:+.1f}%", delta_color="normal" if qqq_3m>=0 else "inverse")
+    r5.metric("YTD",  f"{qqq_ytd:+.1f}%", delta_color="normal" if qqq_ytd>=0 else "inverse")
 
     st.markdown("---")
-    st.markdown("### 📉 최근 90일 지표 추이")
-    rc=sig_df.iloc[-90:].copy()
-    fr=make_subplots(rows=3,cols=1,shared_xaxes=True,
-        subplot_titles=("VIX 공포지수","QQQ 20일 모멘텀 (%)","TNX 60일 변화율 (%)"),
-        vertical_spacing=0.1,row_heights=[0.4,0.3,0.3])
-    fr.add_trace(go.Scatter(x=rc.index,y=rc["VIX"],line=dict(color="#f87171",width=2),name="VIX"),row=1,col=1)
-    fr.add_hline(y=vix_t,line=dict(color="#22c55e",width=1.2,dash="dash"),row=1,col=1,annotation_text=f"임계 {vix_t}",annotation_font_color="#22c55e")
-    cm=["#22c55e" if v>0 else "#f87171" for v in rc["qqq_mom"].fillna(0)]
-    fr.add_trace(go.Bar(x=rc.index,y=rc["qqq_mom"],marker_color=cm,name="모멘텀"),row=2,col=1)
-    fr.add_hline(y=mom_t,line=dict(color="#6366f1",width=1.2,dash="dash"),row=2,col=1,annotation_text=f"임계 {mom_t}%",annotation_font_color="#6366f1")
-    ct=["#f87171" if v>tnx_t else "#22c55e" for v in rc["tnx_chg"].fillna(0)]
-    fr.add_trace(go.Bar(x=rc.index,y=rc["tnx_chg"],marker_color=ct,name="TNX"),row=3,col=1)
-    fr.add_hline(y=tnx_t,line=dict(color="#f87171",width=1.2,dash="dash"),row=3,col=1,annotation_text=f"한도 {tnx_t}%",annotation_font_color="#f87171")
-    fr.update_layout(paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(8,8,15,0.95)",
-                     font=dict(color="#6b7280"),showlegend=False,height=520,margin=dict(l=55,r=20,t=40,b=40))
-    fr.update_xaxes(gridcolor="#151520"); fr.update_yaxes(gridcolor="#151520")
+
+    # ── 핵심 기술적 맥락 ───────────────────────────────────
+    st.markdown("### 🗺️ 기술적 맥락 — 지금 시장이 역사적으로 어디에 있나")
+
+    ctx1, ctx2 = st.columns(2)
+
+    with ctx1:
+        # QQQ 200일선 위치
+        ma_color = "#22c55e" if above_ma else "#f87171"
+        ma_label = "200일선 위 (상승 추세)" if above_ma else "200일선 아래 (하락 추세)"
+        st.markdown(f"""
+        <div style="background:#10101e;border:0.5px solid {ma_color}44;border-radius:10px;padding:1rem 1.25rem;margin-bottom:10px">
+          <div style="font-size:12px;color:#6b7280;margin-bottom:6px">📏 QQQ vs 200일 이동평균선</div>
+          <div style="font-size:20px;font-weight:700;color:{ma_color}">{ma_label}</div>
+          <div style="font-size:13px;color:#9ca3af;margin-top:4px">
+            현재가 ${qqq_now:,.2f} &nbsp;·&nbsp; 200일선 ${ma200:,.2f}
+            &nbsp;·&nbsp; <b style="color:{ma_color}">{ma200_gap:+.1f}%</b>
+          </div>
+          <div style="font-size:11px;color:#5a5a7a;margin-top:6px">
+            200일선 위 = 장기 상승 추세 → 레버리지 ETF 활용 가능 구간<br>
+            200일선 아래 = 하락 추세 → SOXL 같은 레버리지 매우 위험
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+        # 52주 위치
+        pos_color = "#22c55e" if qqq_52pos > 70 else "#fbbf24" if qqq_52pos > 30 else "#f87171"
+        st.markdown(f"""
+        <div style="background:#10101e;border:0.5px solid #22223a;border-radius:10px;padding:1rem 1.25rem">
+          <div style="font-size:12px;color:#6b7280;margin-bottom:8px">📊 52주 가격 범위 내 위치</div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:#5a5a7a;margin-bottom:5px">
+            <span>52주 저점 ${qqq_52l:,.2f}</span><span>52주 고점 ${qqq_52h:,.2f}</span>
+          </div>
+          <div style="background:#1e1e30;border-radius:4px;height:8px;position:relative;margin-bottom:6px">
+            <div style="background:{pos_color};width:{qqq_52pos:.0f}%;height:100%;border-radius:4px"></div>
+          </div>
+          <div style="font-size:13px;color:{pos_color};font-weight:600">52주 범위 내 {qqq_52pos:.0f}% 위치</div>
+          <div style="font-size:11px;color:#5a5a7a;margin-top:3px">
+            0% = 52주 최저점 &nbsp;·&nbsp; 100% = 52주 최고점
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+    with ctx2:
+        # VIX 역사적 맥락
+        vix_zone = (
+            ("극단적 공포 (매수 기회 구간)", "#22c55e") if vix_now >= 30 else
+            ("공포 (주의 요망)", "#86efac") if vix_now >= 20 else
+            ("보통 (중립)", "#fbbf24") if vix_now >= 15 else
+            ("탐욕 (과열 주의)", "#f87171")
+        )
+        st.markdown(f"""
+        <div style="background:#10101e;border:0.5px solid {vix_zone[1]}44;border-radius:10px;padding:1rem 1.25rem;margin-bottom:10px">
+          <div style="font-size:12px;color:#6b7280;margin-bottom:6px">😱 VIX 공포지수 맥락</div>
+          <div style="font-size:20px;font-weight:700;color:{vix_zone[1]}">{vix_now:.1f} — {vix_zone[0]}</div>
+          <div style="font-size:13px;color:#9ca3af;margin-top:4px">
+            역사적 {vix_pct:.0f} 퍼센타일
+            (과거 {vix_pct:.0f}%의 날보다 높은 공포)
+          </div>
+          <div style="background:#1e1e30;border-radius:4px;height:6px;margin:8px 0">
+            <div style="background:{vix_zone[1]};width:{min(vix_now/50*100,100):.0f}%;height:100%;border-radius:4px"></div>
+          </div>
+          <div style="font-size:11px;color:#5a5a7a">
+            &lt;15 탐욕 &nbsp;·&nbsp; 15-20 보통 &nbsp;·&nbsp; 20-30 공포 &nbsp;·&nbsp; &gt;30 극단 공포
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+        # TNX 맥락
+        tnx_zone = (
+            ("금리 급등 중 — 레버리지 위험", "#f87171") if ctnx > tnx_t else
+            ("금리 안정 — 유동성 OK", "#22c55e")
+        )
+        st.markdown(f"""
+        <div style="background:#10101e;border:0.5px solid #22223a;border-radius:10px;padding:1rem 1.25rem">
+          <div style="font-size:12px;color:#6b7280;margin-bottom:6px">📈 10년물 국채금리 (TNX)</div>
+          <div style="font-size:20px;font-weight:700;color:{tnx_zone[1]}">{tnx_now:.2f}% — {tnx_zone[0]}</div>
+          <div style="font-size:13px;color:#9ca3af;margin-top:4px">
+            60일 변화율: <b style="color:{pct_color(ctnx)}">{ctnx:+.1f}%</b>
+            (한도: {tnx_t}% 미만이면 안전)
+          </div>
+          <div style="font-size:11px;color:#5a5a7a;margin-top:6px">
+            금리 급등 = 성장주·나스닥·레버리지 ETF에 직접적 악재<br>
+            2022년 금리 폭등기에 QQQ -33%, SOXL -80% 경험
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── 오라클 신호 상태 ───────────────────────────────────
+    st.markdown("### 🎯 오라클 전략 신호 상태")
+    sg1, sg2 = st.columns([1, 1])
+
+    with sg1:
+        fg = go.Figure(go.Indicator(mode="gauge+number", value=nok,
+            title={"text": f"<b>{state}</b>", "font": {"color": cs, "size": 15}},
+            number={"suffix": " / 3 조건", "font": {"color": "#ddddf0", "size": 28}},
+            gauge={"axis": {"range": [0,3], "tickcolor": "#6b7280"},
+                   "bar": {"color": cs, "thickness": 0.28}, "bgcolor": "#10101e", "borderwidth": 0,
+                   "steps": [{"range": [0,3], "color": "#141426"}],
+                   "threshold": {"line": {"color": cs, "width": 4}, "thickness": 0.8, "value": nok}}))
+        fg.update_layout(paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#9ca3af"),
+                         height=220, margin=dict(l=20, r=20, t=40, b=10))
+        st.plotly_chart(fg, use_container_width=True)
+
+    with sg2:
+        def fcard(label, val_str, ok, note):
+            ic = "✅" if ok else "❌"; bc = "#22c55e33" if ok else "#f8717122"; vc = "#22c55e" if ok else "#f87171"
+            return (f'<div style="background:#10101e;border:0.5px solid {bc};border-radius:10px;'
+                    f'padding:10px 14px;margin-bottom:7px">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                    f'<span style="color:#ddddf0;font-size:13px;font-weight:500">{ic} {label}</span>'
+                    f'<span style="color:{vc};font-family:monospace;font-size:16px;font-weight:600">{val_str}</span>'
+                    f'</div><div style="font-size:11px;color:#5a5a7a;margin-top:2px">{note}</div></div>')
+        vs = f"{cvix:.1f}" if not np.isnan(cvix) else "N/A"
+        ms = f"{cmom:+.1f}%" if not np.isnan(cmom) else "N/A"
+        ts = f"{ctnx:+.1f}%" if not np.isnan(ctnx) else "N/A"
+        st.markdown(
+            fcard("VIX 공포지수", vs, fv, f"임계값 {vix_t} 이상이어야 함 → {'✔ 충족' if fv else '✘ 미충족'}") +
+            fcard("QQQ 20일 수익률", ms, fmo, f"20일 수익률 {mom_t}% 이상이어야 함 → {'✔ 충족' if fmo else '✘ 미충족'}") +
+            fcard("TNX 60일 변화율", ts, fm, f"금리 변화율 {tnx_t}% 미만이어야 함 → {'✔ 충족' if fm else '✘ 미충족'}"),
+            unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="background:#10101e;border:0.5px solid {cs}44;border-radius:10px;'
+            f'padding:10px 14px;color:{cs};font-size:13px">💬 {adv}</div>',
+            unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── 최근 신호 발생 이력 ────────────────────────────────
+    if not trades.empty:
+        st.markdown("### 📋 최근 신호 발생 이력")
+        recent_trades = trades.tail(10).copy()
+        st.caption("최근 10개 스위칭 신호 — 어떤 시장 환경에서 신호가 발생했는지 참고하세요.")
+        def cf(v):
+            if v == "QQQ→SOXL": return "color:#22c55e;font-weight:600"
+            if v == "SOXL→QQQ": return "color:#f87171;font-weight:600"
+            return ""
+        st.dataframe(recent_trades.style.map(cf, subset=["액션"]),
+                     use_container_width=True, height=280)
+
+    st.markdown("---")
+
+    # ── 지표 추이 차트 ─────────────────────────────────────
+    st.markdown("### 📉 최근 120일 지표 추이")
+    rc = sig_df.iloc[-120:].copy()
+
+    fr = make_subplots(rows=4, cols=1, shared_xaxes=True,
+        subplot_titles=("QQQ vs 200일선", "VIX 공포지수",
+                        "QQQ 20일 모멘텀 (%)", "TNX 60일 변화율 (%)"),
+        vertical_spacing=0.08, row_heights=[0.35, 0.25, 0.2, 0.2])
+
+    # QQQ + 200일선
+    fr.add_trace(go.Scatter(x=rc.index, y=rc["QQQ"],
+        line=dict(color="#818cf8", width=2), name="QQQ"), row=1, col=1)
+    fr.add_trace(go.Scatter(x=rc.index, y=rc["qqq_ma200"],
+        line=dict(color="#fbbf24", width=1.5, dash="dash"), name="200일선"), row=1, col=1)
+
+    # VIX
+    fr.add_trace(go.Scatter(x=rc.index, y=rc["VIX"],
+        line=dict(color="#f87171", width=2), name="VIX", showlegend=False), row=2, col=1)
+    fr.add_hline(y=vix_t, line=dict(color="#22c55e", width=1.2, dash="dash"),
+        row=2, col=1, annotation_text=f"임계 {vix_t}",
+        annotation_font_color="#22c55e")
+
+    # 모멘텀 바
+    cm = ["#22c55e" if v > 0 else "#f87171" for v in rc["qqq_mom"].fillna(0)]
+    fr.add_trace(go.Bar(x=rc.index, y=rc["qqq_mom"],
+        marker_color=cm, name="모멘텀", showlegend=False), row=3, col=1)
+    fr.add_hline(y=mom_t, line=dict(color="#6366f1", width=1.2, dash="dash"),
+        row=3, col=1, annotation_text=f"임계 {mom_t}%",
+        annotation_font_color="#6366f1")
+
+    # TNX 바
+    ct = ["#f87171" if v > tnx_t else "#22c55e" for v in rc["tnx_chg"].fillna(0)]
+    fr.add_trace(go.Bar(x=rc.index, y=rc["tnx_chg"],
+        marker_color=ct, name="TNX 변화율", showlegend=False), row=4, col=1)
+    fr.add_hline(y=tnx_t, line=dict(color="#f87171", width=1.2, dash="dash"),
+        row=4, col=1, annotation_text=f"한도 {tnx_t}%",
+        annotation_font_color="#f87171")
+
+    fr.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(8,8,15,0.95)",
+                     font=dict(color="#6b7280"), height=600,
+                     margin=dict(l=55, r=20, t=40, b=40),
+                     legend=dict(bgcolor="rgba(10,10,20,0.85)", bordercolor="#2a2a3a", borderwidth=1))
+    fr.update_xaxes(gridcolor="#151520")
+    fr.update_yaxes(gridcolor="#151520")
     st.plotly_chart(fr, use_container_width=True)
 
 
-# ════════════════════════════════════════════════════════
-# TAB 3
-# ════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
+# TAB 3 — 시뮬레이터
+# ════════════════════════════════════════════════════════════
 with tab3:
     st.markdown("### 🚀 목표 자산 시뮬레이터")
-    s1,s2,s3=st.columns(3)
-    with s1: si=st.number_input("현재 보유 자산 (원)",0,500_000_000,0,100_000,format="%d")
-    with s2: sm=st.number_input("월 적립 가능액 (원)",0,10_000_000,300_000,50_000,format="%d")
-    with s3: stg=st.date_input("목표일",value=date(2027,6,1),min_value=date.today())
-    mths=max(1,(stg.year-date.today().year)*12+(stg.month-date.today().month))
+    s1, s2, s3 = st.columns(3)
+    with s1: si = st.number_input("현재 보유 자산 (원)", 0, 500_000_000, 0, 100_000, format="%d")
+    with s2: sm = st.number_input("월 적립 가능액 (원)", 0, 10_000_000, 300_000, 50_000, format="%d")
+    with s3: stg = st.date_input("목표일", value=date(2027, 6, 1), min_value=date.today())
+    mths = max(1, (stg.year-date.today().year)*12 + (stg.month-date.today().month))
 
-    def fv_calc(p0,pmt,n,ar):
-        r=(1+ar)**(1/12)-1
-        return p0*(1+r)**n+(pmt*(((1+r)**n-1)/r) if r>0.0001 else pmt*n)
+    def fv_calc(p0, pmt, n, ar):
+        r = (1+ar)**(1/12)-1
+        return p0*(1+r)**n + (pmt*(((1+r)**n-1)/r) if r > 0.0001 else pmt*n)
 
-    ro,rd,rs=om["cagr"]/100,dm["cagr"]/100,0.04
-    vo=fv_calc(si,sm,mths,ro); vd=fv_calc(si,sm,mths,rd)
-    vsa=fv_calc(si,sm,mths,rs); vt=si+sm*mths
+    ro, rd, rs = om["cagr"]/100, dm["cagr"]/100, 0.04
+    vo = fv_calc(si, sm, mths, ro); vd = fv_calc(si, sm, mths, rd)
+    vsa = fv_calc(si, sm, mths, rs); vt = si + sm * mths
 
     st.markdown("---")
-    st.markdown(f"#### {stg.strftime('%Y년 %m월 %d일')} 기준 예상 자산 ({mths}개월 후)")
+    st.markdown(f"#### {stg.strftime('%Y년 %m월 %d일')} 예상 자산 ({mths}개월 후)")
     st.caption(f"총 투입 예정금: {fmt_full(vt)} (현재 {fmt_full(si)} + 월 {fmt_full(sm)} × {mths}개월)")
-    m1,m2,m3=st.columns(3)
-    m1.metric("🛡️ 안전 투자 (연 4%)",fmt_full(vsa),f"+{(vsa/vt-1)*100:.0f}%" if vt>0 else "—")
-    m2.metric("📊 QQQ 그냥 적립",fmt_full(vd),f"+{(vd/vt-1)*100:.0f}%" if vt>0 else "—")
-    m3.metric(f"🔮 오라클 (연 {ro*100:.1f}%)",fmt_full(vo),f"+{(vo/vt-1)*100:.0f}%" if vt>0 else "—")
 
-    sim_m=[*range(mths+1)]; sd=[date.today().replace(day=1)]
+    m1, m2, m3 = st.columns(3)
+    m1.metric("🛡️ 안전 투자 (연 4%)", fmt_full(vsa),
+               f"+{(vsa/vt-1)*100:.0f}% 수익" if vt > 0 else "—")
+    m2.metric("📊 QQQ 그냥 적립", fmt_full(vd),
+               f"+{(vd/vt-1)*100:.0f}% 수익" if vt > 0 else "—")
+    m3.metric(f"🔮 오라클 (연 {ro*100:.1f}%)", fmt_full(vo),
+               f"+{(vo/vt-1)*100:.0f}% 수익" if vt > 0 else "—")
+
+    # 성장 차트
+    sim_m = list(range(mths+1))
+    sd = [date.today().replace(day=1)]
     for _ in range(mths):
-        d=sd[-1]; nm=d.month+1 if d.month<12 else 1; ny=d.year if d.month<12 else d.year+1
-        sd.append(d.replace(year=ny,month=nm))
-    fs=go.Figure()
-    fs.add_trace(go.Scatter(x=sd,y=[si+sm*m for m in sim_m],name="투입 원금",
-        line=dict(color="#2d2d4a",width=1.5,dash="dot"),fill="tozeroy",fillcolor="rgba(45,45,74,0.15)"))
-    fs.add_trace(go.Scatter(x=sd,y=[fv_calc(si,sm,m,rs) for m in sim_m],name="안전(4%)",line=dict(color="#374151",width=1.5)))
-    fs.add_trace(go.Scatter(x=sd,y=[fv_calc(si,sm,m,rd) for m in sim_m],name="QQQ 적립",line=dict(color="#6b7280",width=2,dash="dash")))
-    fs.add_trace(go.Scatter(x=sd,y=[fv_calc(si,sm,m,ro) for m in sim_m],name="오라클",line=dict(color="#22c55e",width=2.5)))
-    fs.update_layout(**LAY,height=300,xaxis=dict(**AX),yaxis=dict(**AX,tickformat=",.0f",title="예상 자산 (원)"),
-        legend=dict(bgcolor="rgba(10,10,20,0.85)",bordercolor="#2a2a3a",borderwidth=1))
+        d = sd[-1]; nm = d.month+1 if d.month<12 else 1; ny = d.year if d.month<12 else d.year+1
+        sd.append(d.replace(year=ny, month=nm))
+
+    fs = go.Figure()
+    fs.add_trace(go.Scatter(x=sd, y=[si+sm*m for m in sim_m], name="투입 원금",
+        line=dict(color="#2d2d4a", width=1.5, dash="dot"),
+        fill="tozeroy", fillcolor="rgba(45,45,74,0.15)"))
+    fs.add_trace(go.Scatter(x=sd, y=[fv_calc(si,sm,m,rs) for m in sim_m],
+        name="안전(4%)", line=dict(color="#374151", width=1.5)))
+    fs.add_trace(go.Scatter(x=sd, y=[fv_calc(si,sm,m,rd) for m in sim_m],
+        name="QQQ 적립", line=dict(color="#6b7280", width=2, dash="dash")))
+    fs.add_trace(go.Scatter(x=sd, y=[fv_calc(si,sm,m,ro) for m in sim_m],
+        name="오라클", line=dict(color="#22c55e", width=2.5)))
+    fs.update_layout(**LAY, height=300, xaxis=dict(**AX),
+        yaxis=dict(**AX, tickformat=",.0f", title="예상 자산 (원)"),
+        legend=dict(bgcolor="rgba(10,10,20,0.85)", bordercolor="#2a2a3a", borderwidth=1))
     st.plotly_chart(fs, use_container_width=True)
 
+    # 목표 달성도
     st.markdown("---")
     st.markdown("#### 🎯 내 목표 달성도")
-    st.caption("목표를 직접 입력하면 각 전략별 달성 가능 여부를 보여줍니다.")
-    if "n_goals" not in st.session_state: st.session_state.n_goals=2
-    _,gb=st.columns([5,1])
+    st.caption("목표를 직접 입력하면 전략별로 얼마나 달성하는지 보여줍니다.")
+
+    if "n_goals" not in st.session_state: st.session_state.n_goals = 2
+    _, gb = st.columns([5, 1])
     with gb:
-        if st.button("+ 목표 추가"): st.session_state.n_goals=min(st.session_state.n_goals+1,6)
-    dn=["첫 번째 목표","두 번째 목표","세 번째 목표","네 번째 목표","다섯 번째 목표","여섯 번째 목표"]
-    da=[30_000_000,100_000_000,50_000_000,200_000_000,500_000_000,1_000_000_000]
-    goals=[]
+        if st.button("+ 목표 추가"): st.session_state.n_goals = min(st.session_state.n_goals+1, 6)
+
+    dn = ["첫 번째 목표","두 번째 목표","세 번째 목표","네 번째 목표","다섯 번째 목표","여섯 번째 목표"]
+    da = [30_000_000, 100_000_000, 50_000_000, 200_000_000, 500_000_000, 1_000_000_000]
+    goals = []
     for i in range(st.session_state.n_goals):
-        g1,g2=st.columns(2)
-        with g1: gn=st.text_input(f"목표{i+1}이름",value=dn[i],key=f"gname_{i}",label_visibility="collapsed",placeholder=f"목표 {i+1} 이름")
-        with g2: ga=st.number_input(f"목표{i+1}금액",value=da[i],step=1_000_000,format="%d",key=f"gamt_{i}",label_visibility="collapsed")
-        goals.append((gn,ga))
-    st.markdown("<br>",unsafe_allow_html=True)
-    for gn,ga in goals:
-        if ga<=0: continue
-        st.markdown(f"<div style='color:#c0c0d8;font-size:14px;font-weight:600;margin-bottom:8px'>🎯 {gn} — 목표 {fmt_full(ga)}</div>",unsafe_allow_html=True)
-        for sn,sv,sc in [("🛡️ 안전(4%)",vsa,"#4b5563"),("📊 QQQ적립",vd,"#6b7280"),("🔮 오라클",vo,"#22c55e")]:
-            r=sv/ga; bw=min(r*100,100); c="#22c55e" if r>=1 else "#fbbf24" if r>=0.5 else sc; lb="✅ 달성!" if r>=1 else f"{r*100:.0f}%"
+        g1, g2 = st.columns(2)
+        with g1: gn = st.text_input(f"목표{i+1}이름", value=dn[i], key=f"gname_{i}",
+                                     label_visibility="collapsed", placeholder=f"목표 {i+1} 이름")
+        with g2: ga = st.number_input(f"목표{i+1}금액", value=da[i], step=1_000_000,
+                                       format="%d", key=f"gamt_{i}", label_visibility="collapsed")
+        goals.append((gn, ga))
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    for gn, ga in goals:
+        if ga <= 0: continue
+        st.markdown(f"<div style='color:#c0c0d8;font-size:14px;font-weight:600;margin-bottom:8px'>"
+                    f"🎯 {gn} — 목표 {fmt_full(ga)}</div>", unsafe_allow_html=True)
+        for sn, sv, sc in [("🛡️ 안전(4%)",vsa,"#4b5563"),("📊 QQQ적립",vd,"#6b7280"),("🔮 오라클",vo,"#22c55e")]:
+            r = sv/ga; bw = min(r*100, 100)
+            c = "#22c55e" if r>=1 else "#fbbf24" if r>=0.5 else sc
+            lb = "✅ 달성!" if r>=1 else f"{r*100:.0f}%"
             st.markdown(f"""<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
               <span style="color:#6b7280;font-size:12px;min-width:72px">{sn}</span>
-              <div style="flex:1;background:#151520;border-radius:3px;height:7px"><div style="background:{c};width:{bw:.0f}%;height:100%;border-radius:3px"></div></div>
-              <span style="color:{c};font-size:12px;font-weight:600;min-width:88px;text-align:right">{fmt(sv)} ({lb})</span>
-            </div>""",unsafe_allow_html=True)
-        st.markdown("<div style='height:8px'></div>",unsafe_allow_html=True)
+              <div style="flex:1;background:#151520;border-radius:3px;height:7px">
+                <div style="background:{c};width:{bw:.0f}%;height:100%;border-radius:3px"></div></div>
+              <span style="color:{c};font-size:12px;font-weight:600;min-width:88px;text-align:right">
+                {fmt(sv)} ({lb})</span>
+            </div>""", unsafe_allow_html=True)
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
     st.caption(f"⚠️ 오라클 CAGR {ro*100:.1f}%가 미래에도 동일하다는 낙관적 가정입니다.")
 
 
-# ════════════════════════════════════════════════════════
-# TAB 4 — WALK-FORWARD TEST
-# ════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
+# TAB 4 — 과적합 검증
+# ════════════════════════════════════════════════════════════
 with tab4:
     st.markdown("### 🔬 과적합 검증 — Walk-Forward Test")
 
@@ -601,106 +862,108 @@ with tab4:
 **슬라이더를 움직여 수익이 가장 높은 파라미터를 찾는 것 = Overfitting(과적합)**
 
 과거 데이터에 파라미터를 맞추면 항상 좋아 보입니다.
-미래에도 통하는지는 **보지 못한 데이터에서 검증**해야 알 수 있습니다.
+**보지 못한 미래 데이터에서도 통하는지** 별도로 검증해야 합니다.
 
 #### Walk-Forward Test 방법
-1. 전체 데이터를 **학습 구간 / 검증 구간**으로 분리
+1. 데이터를 **학습 구간 / 검증 구간**으로 분리
 2. 학습 구간에서만 최적 파라미터 탐색
-3. 찾은 파라미터를 검증 구간에 **그대로 (수정 없이)** 적용
-4. 검증 구간에서도 QQQ 적립을 이기면 → 전략이 실제로 유효
-5. 검증 구간에서 무너지면 → 과적합, 미래에 통하지 않을 가능성 높음
+3. 그 파라미터를 검증 구간에 **수정 없이** 그대로 적용
+4. 검증 구간에서도 QQQ 적립을 이기면 → 전략 유효
+5. 검증 구간에서 무너지면 → 과적합, 미래 통하지 않을 가능성 높음
 
-#### ⚠️ VIX=15, 모멘텀=0이 수익이 높게 나오는 이유
-이 파라미터는 조건이 거의 항상 충족되어 SOXL을 계속 보유하는 것과 같습니다.
-2014~2024가 반도체 역사상 최고의 불장이었기 때문에 좋아 보이는 것이지,
-전략의 우수성이 아닙니다. 2022년 금리 급등기에도 통했는지 검증해 보세요.
+#### ⚠️ VIX=15, 모멘텀=0이 수익 높게 나오는 이유
+조건이 거의 항상 충족되어 SOXL을 계속 보유하는 것과 같습니다.
+2014~2024가 반도체 역사상 최고의 불장이었기 때문입니다.
+2022년 금리 급등기에도 통했는지 이 탭에서 확인해 보세요.
         """)
 
     st.markdown("---")
-    w1,w2=st.columns(2)
+    w1, w2 = st.columns(2)
     with w1:
-        tey=st.slider("학습 구간 종료 연도",2017,2022,2020)
+        tey = st.slider("학습 구간 종료 연도", 2017, 2022, 2020)
         st.caption(f"학습: 2014-01-01 ~ {tey}-12-31  \n검증: {tey+1}-01-01 ~ 현재")
     with w2:
-        ntr=(raw[raw.index<=f"{tey}-12-31"]).shape[0]
-        nte=(raw[raw.index>f"{tey}-12-31"]).shape[0]
-        st.metric("학습 구간 거래일",f"{ntr:,}일"); st.metric("검증 구간 거래일",f"{nte:,}일")
+        ntr = (raw[raw.index <= f"{tey}-12-31"]).shape[0]
+        nte = (raw[raw.index >  f"{tey}-12-31"]).shape[0]
+        st.metric("학습 구간 거래일", f"{ntr:,}일"); st.metric("검증 구간 거래일", f"{nte:,}일")
 
     st.markdown("#### 🔍 탐색할 파라미터 후보")
-    p1,p2,p3=st.columns(3)
-    with p1: vo_=st.multiselect("VIX 후보값",[15,20,25,30,35,40],default=[20,25,30,35])
-    with p2: mo_=st.multiselect("모멘텀 후보 (%)",[0,1,2,3,5,8],default=[1,2,3,5])
-    with p3: to_=st.multiselect("TNX 한도 후보 (%)",[3,5,8,10,15],default=[3,5,8,10])
+    p1, p2, p3 = st.columns(3)
+    with p1: vo_ = st.multiselect("VIX 후보값", [15,20,25,30,35,40], default=[20,25,30,35])
+    with p2: mo_ = st.multiselect("모멘텀 후보 (%)", [0,1,2,3,5,8], default=[1,2,3,5])
+    with p3: to_ = st.multiselect("TNX 한도 후보 (%)", [3,5,8,10,15], default=[3,5,8,10])
 
-    nc=len(vo_)*len(mo_)*len(to_)
+    nc = len(vo_) * len(mo_) * len(to_)
     st.caption(f"총 {nc}개 조합 (약 {max(5,nc//8)}~{max(10,nc//4)}초 소요)")
 
     if st.button("🚀 검증 실행", type="primary", disabled=(nc==0)):
-        dtr=raw[raw.index<=f"{tey}-12-31"].copy()
-        dte=raw[raw.index>f"{tey}-12-31"].copy()
-        if len(dte)<100:
-            st.error("검증 구간이 너무 짧습니다. 학습 종료 연도를 앞으로 당겨주세요.")
+        dtr = raw[raw.index <= f"{tey}-12-31"].copy()
+        dte = raw[raw.index >  f"{tey}-12-31"].copy()
+        if len(dte) < 100:
+            st.error("검증 구간이 너무 짧습니다.")
         else:
-            wf=walk_forward_test(dtr,dte,initial_cap,monthly_inv,vo_,mo_,to_)
-            st.session_state["wf"]=wf
+            wf = walk_forward_test(dtr, dte, initial_cap, monthly_inv, vo_, mo_, to_)
+            st.session_state["wf"] = wf
 
     if "wf" in st.session_state:
-        wf=st.session_state["wf"]
-        bv,bm,bt_=wf["best_vix"],wf["best_mom"],wf["best_tnx"]
+        wf = st.session_state["wf"]
+        bv, bm, bt_ = wf["best_vix"], wf["best_mom"], wf["best_tnx"]
+
         st.markdown("---")
         st.markdown("#### 🏆 학습 구간 최적 파라미터")
-        x1,x2,x3=st.columns(3)
-        x1.metric("VIX 임계값",f"{bv}"); x2.metric("모멘텀 기준",f"{bm}%"); x3.metric("TNX 60일 한도",f"{bt_}%")
+        x1, x2, x3 = st.columns(3)
+        x1.metric("VIX 임계값", f"{bv}")
+        x2.metric("모멘텀 기준", f"{bm}%")
+        x3.metric("TNX 60일 한도", f"{bt_}%")
 
         st.markdown("---")
         st.markdown("#### 📊 학습 vs 검증 성과 비교")
         st.markdown("**검증 구간에서도 QQQ 적립을 이기는가**가 핵심입니다.")
 
-        cdf=pd.DataFrame({
-            "구간":["학습","학습","검증","검증"],
-            "전략":["오라클","QQQ 적립","오라클","QQQ 적립"],
-            "CAGR (%)":[round(wf["tr_oracle"]["cagr"],1),round(wf["tr_dca"]["cagr"],1),
-                         round(wf["te_oracle"]["cagr"],1),round(wf["te_dca"]["cagr"],1)],
-            "MDD (%)":[round(wf["tr_oracle"]["mdd"],1),round(wf["tr_dca"]["mdd"],1),
-                       round(wf["te_oracle"]["mdd"],1),round(wf["te_dca"]["mdd"],1)],
-            "샤프":[round(wf["tr_oracle"]["sharpe"],2),round(wf["tr_dca"]["sharpe"],2),
-                   round(wf["te_oracle"]["sharpe"],2),round(wf["te_dca"]["sharpe"],2)],
+        cdf = pd.DataFrame({
+            "구간":      ["학습", "학습", "검증", "검증"],
+            "전략":      ["오라클", "QQQ 적립", "오라클", "QQQ 적립"],
+            "CAGR (%)":  [round(wf["tr_oracle"]["cagr"],1), round(wf["tr_dca"]["cagr"],1),
+                           round(wf["te_oracle"]["cagr"],1), round(wf["te_dca"]["cagr"],1)],
+            "MDD (%)":   [round(wf["tr_oracle"]["mdd"],1),  round(wf["tr_dca"]["mdd"],1),
+                           round(wf["te_oracle"]["mdd"],1),  round(wf["te_dca"]["mdd"],1)],
+            "샤프":      [round(wf["tr_oracle"]["sharpe"],2), round(wf["tr_dca"]["sharpe"],2),
+                           round(wf["te_oracle"]["sharpe"],2), round(wf["te_dca"]["sharpe"],2)],
         })
         st.dataframe(cdf, use_container_width=True, hide_index=True)
 
-        tg=wf["te_oracle"]["cagr"]-wf["te_dca"]["cagr"]
-        trg=wf["tr_oracle"]["cagr"]-wf["tr_dca"]["cagr"]
-        if tg>0 and (trg-tg)<trg*0.5:
-            st.success(f"✅ 과적합 없음 — 검증 구간에서도 QQQ 적립 대비 +{tg:.1f}%p 초과 (학습 +{trg:.1f}%p → 검증 +{tg:.1f}%p)")
-        elif tg>0:
-            st.warning(f"⚠️ 성과 감소 — 검증 구간에서 여전히 QQQ를 이기지만 학습보다 줄었습니다 (학습 +{trg:.1f}%p → 검증 +{tg:.1f}%p)")
+        tg  = wf["te_oracle"]["cagr"] - wf["te_dca"]["cagr"]
+        trg = wf["tr_oracle"]["cagr"] - wf["tr_dca"]["cagr"]
+        if tg > 0 and (trg-tg) < trg*0.5:
+            st.success(f"✅ 과적합 없음 — 검증 구간에서도 +{tg:.1f}%p 초과 (학습 +{trg:.1f}%p → 검증 +{tg:.1f}%p)")
+        elif tg > 0:
+            st.warning(f"⚠️ 성과 감소 — 여전히 QQQ를 이기지만 줄었습니다 (학습 +{trg:.1f}%p → 검증 +{tg:.1f}%p)")
         else:
-            st.error(f"❌ 과적합 의심 — 검증 구간에서 QQQ 단순 적립보다 {abs(tg):.1f}%p 낮습니다. 학습 구간 과적합 가능성 높음")
+            st.error(f"❌ 과적합 의심 — 검증 구간에서 QQQ 단순 적립보다 {abs(tg):.1f}%p 낮습니다.")
 
         st.markdown("---")
-        st.markdown("#### 📈 검증 구간 자산 비교 차트")
-        st.caption(f"최적 파라미터 (VIX={bv}, 모멘텀={bm}%, TNX={bt_}%)를 검증 구간에 그대로 적용한 결과")
-        bte=wf["bt_te"]; cte=wf["con_te"]
-        fw=go.Figure()
-        fw.add_trace(go.Scatter(x=bte.index,y=cte,name="누적 투입금",
-            line=dict(color="#2d2d4a",width=1.5,dash="dot"),fill="tozeroy",fillcolor="rgba(45,45,74,0.15)"))
-        fw.add_trace(go.Scatter(x=bte.index,y=bte["dca"],name="QQQ 적립 (검증)",
-            line=dict(color="#6b7280",width=2,dash="dash")))
-        fw.add_trace(go.Scatter(x=bte.index,y=bte["oracle"],name="오라클 (검증)",
-            line=dict(color="#22c55e",width=2.5)))
-        ete=bte[bte["entry"]==True]; xte=bte[bte["exit_sig"]==True]
-        fw.add_trace(go.Scatter(x=ete.index,y=ete["oracle"],mode="markers",name="SOXL 진입",
-            marker=dict(color="#22c55e",size=9,symbol="triangle-up",line=dict(color="white",width=1))))
-        fw.add_trace(go.Scatter(x=xte.index,y=xte["oracle"],mode="markers",name="QQQ 복귀",
-            marker=dict(color="#f87171",size=7,symbol="triangle-down",line=dict(color="white",width=1))))
-        fw.update_layout(**LAY,height=400,xaxis=dict(**AX),
-            yaxis=dict(**AX,title="포트폴리오 (원)",tickformat=",.0f"),
-            legend=dict(bgcolor="rgba(10,10,20,0.85)",bordercolor="#2a2a3a",borderwidth=1))
+        st.markdown("#### 📈 검증 구간 자산 비교")
+        bte = wf["bt_te"]; cte = wf["con_te"]
+        fw = go.Figure()
+        fw.add_trace(go.Scatter(x=bte.index, y=cte, name="누적 투입금",
+            line=dict(color="#2d2d4a", width=1.5, dash="dot"),
+            fill="tozeroy", fillcolor="rgba(45,45,74,0.15)"))
+        fw.add_trace(go.Scatter(x=bte.index, y=bte["dca"], name="QQQ 적립",
+            line=dict(color="#6b7280", width=2, dash="dash")))
+        fw.add_trace(go.Scatter(x=bte.index, y=bte["oracle"], name="오라클",
+            line=dict(color="#22c55e", width=2.5)))
+        ete = bte[bte["entry"]==True]; xte = bte[bte["exit_sig"]==True]
+        fw.add_trace(go.Scatter(x=ete.index, y=ete["oracle"], mode="markers", name="SOXL 진입",
+            marker=dict(color="#22c55e", size=9, symbol="triangle-up", line=dict(color="white",width=1))))
+        fw.add_trace(go.Scatter(x=xte.index, y=xte["oracle"], mode="markers", name="QQQ 복귀",
+            marker=dict(color="#f87171", size=7, symbol="triangle-down", line=dict(color="white",width=1))))
+        fw.update_layout(**LAY, height=400, xaxis=dict(**AX),
+            yaxis=dict(**AX, title="포트폴리오 (원)", tickformat=",.0f"),
+            legend=dict(bgcolor="rgba(10,10,20,0.85)", bordercolor="#2a2a3a", borderwidth=1))
         st.plotly_chart(fw, use_container_width=True)
 
         with st.expander("🗺️ 파라미터 탐색 결과 (상위 20개)"):
-            st.dataframe(wf["grid"].head(20).reset_index(drop=True),
-                         use_container_width=True)
+            st.dataframe(wf["grid"].head(20).reset_index(drop=True), use_container_width=True)
             st.caption("학습 구간 기준 정렬. 검증 구간에서도 좋은 파라미터가 진짜 유효합니다.")
 
 
