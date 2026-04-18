@@ -36,16 +36,46 @@ div[data-testid="stMetricValue"]    { color:#ddddf0 !important; }
 # ── DATA ─────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data(start="2014-01-01"):
-    end, frames = datetime.today().strftime("%Y-%m-%d"), {}
+    import time, requests_cache
+    end    = datetime.today().strftime("%Y-%m-%d")
+    # 브라우저 User-Agent + 디스크 캐시 (1시간) → 차단 방지
+    sess   = requests_cache.CachedSession("yf_cache", expire_after=3600)
+    sess.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/122.0.0.0 Safari/537.36"),
+        "Accept-Language": "en-US,en;q=0.5",
+    })
+    frames = {}
     for col, sym in {"QQQ":"QQQ","SOXL":"SOXL","VIX":"^VIX","TNX":"^TNX"}.items():
-        try:
-            raw = yf.download(sym, start=start, end=end, progress=False, auto_adjust=True)
-            if raw.empty:
-                st.error(f"데이터 없음: {sym}"); return None
-            s = raw["Close"]
-            frames[col] = s.squeeze() if isinstance(s, pd.DataFrame) else s
-        except Exception as e:
-            st.error(f"다운로드 실패: {sym} — {e}"); return None
+        ok = False
+        # 방법 1: Ticker().history() — 야후 차단 우회에 더 안정적
+        for attempt in range(3):
+            try:
+                raw = yf.Ticker(sym, session=sess).history(
+                    start=start, end=end, auto_adjust=True)
+                if not raw.empty:
+                    s = raw["Close"]
+                    frames[col] = s.squeeze() if isinstance(s, pd.DataFrame) else s
+                    ok = True; break
+            except Exception:
+                time.sleep(2 ** attempt)
+        # 방법 2: download() 폴백
+        if not ok:
+            try:
+                raw = yf.download(sym, start=start, end=end,
+                                  progress=False, auto_adjust=True, session=sess)
+                if not raw.empty:
+                    s = raw["Close"]
+                    frames[col] = s.squeeze() if isinstance(s, pd.DataFrame) else s
+                    ok = True
+            except Exception as e:
+                st.error(f"❌ {sym} 로드 실패: {e}  \n새로고침(F5)하거나 잠시 후 다시 시도하세요.")
+                return None
+        if not ok:
+            st.error(f"❌ {sym} 데이터를 가져올 수 없습니다. 네트워크를 확인하세요.")
+            return None
+        time.sleep(0.6)   # 요청 간 딜레이 — 차단 방지
     df = pd.DataFrame(frames).ffill().dropna(subset=["QQQ","VIX"])
     df["SOXL"] = df["SOXL"].fillna(df["QQQ"])
     return df
@@ -67,40 +97,62 @@ def compute_signals(df, vix_thresh=25.0, mom_days=20,
 
 # ── BACKTEST ─────────────────────────────────────────────────
 def run_backtest(df, initial=10_000_000, monthly=500_000, tx_cost=0.001):
-    o_qqq, o_soxl, in_soxl = initial/df["QQQ"].iloc[0], 0.0, False
-    b_qqq      = initial/df["QQQ"].iloc[0]
-    records, trade_log, prev_month = [], [], df.index[0].month
+    # numpy 배열로 사전 추출 — iterrows() 대비 3~5배 빠름
+    idx     = df.index
+    n       = len(idx)
+    qp_a    = df["QQQ"].to_numpy(dtype=float)
+    sp_a    = df["SOXL"].to_numpy(dtype=float)
+    ent_a   = df["entry"].to_numpy(dtype=bool)
+    ex_a    = df["exit_sig"].to_numpy(dtype=bool)
+    vix_a   = df["VIX"].to_numpy(dtype=float)
+    mom_a   = df.get("qqq_mom", pd.Series(np.nan, index=idx)).to_numpy(dtype=float)
+    tnx_a   = df.get("tnx_chg", pd.Series(np.nan, index=idx)).to_numpy(dtype=float)
 
-    for i, (dt, row) in enumerate(df.iterrows()):
-        qp = float(row["QQQ"])
-        sp = float(row["SOXL"]) if pd.notna(row["SOXL"]) else qp
-        if i > 0 and dt.month != prev_month:
+    # 월 변경 마스크
+    m_arr   = np.array([d.month for d in idx])
+    m_chg   = np.zeros(n, dtype=bool)
+    m_chg[1:] = m_arr[1:] != m_arr[:-1]
+
+    o_qqq, o_soxl, in_soxl = initial/qp_a[0], 0.0, False
+    b_qqq = initial/qp_a[0]
+
+    oracle_v  = np.empty(n);  dca_v    = np.empty(n)
+    insoxl_v  = np.empty(n, dtype=bool)
+    entry_v   = np.zeros(n,  dtype=bool)
+    exit_v    = np.zeros(n,  dtype=bool)
+    trade_log = []
+
+    for i in range(n):
+        qp = qp_a[i]; sp = sp_a[i]
+        if i > 0 and m_chg[i]:
             if in_soxl:
                 o_qqq += (monthly*.5)/qp; o_soxl += (monthly*.5)/sp
             else:
                 o_qqq += monthly/qp
             b_qqq += monthly/qp
-        prev_month = dt.month
         if i >= 1:
-            if bool(row.get("entry",False)) and not in_soxl:
+            if ent_a[i] and not in_soxl:
                 sw=o_qqq*qp*.5; o_qqq-=sw/qp; o_soxl=sw*(1-tx_cost)/sp; in_soxl=True
-                trade_log.append({"날짜":dt.date(),"액션":"QQQ→SOXL",
-                    "VIX":round(float(row["VIX"]),1),
-                    "QQQ 모멘텀(%)":round(float(row["qqq_mom"]),2),
-                    "TNX 변화율(%)":round(float(row["tnx_chg"]),2)})
-            elif bool(row.get("exit_sig",False)) and in_soxl:
+                entry_v[i]=True
+                trade_log.append({"날짜":idx[i].date(),"액션":"QQQ→SOXL",
+                    "VIX":round(vix_a[i],1),
+                    "QQQ 모멘텀(%)":round(float(mom_a[i]),2),
+                    "TNX 변화율(%)":round(float(tnx_a[i]),2)})
+            elif ex_a[i] and in_soxl:
                 sv=o_soxl*sp*(1-tx_cost); o_qqq+=sv/qp; o_soxl=0.0; in_soxl=False
-                trade_log.append({"날짜":dt.date(),"액션":"SOXL→QQQ",
-                    "VIX":round(float(row["VIX"]),1),
-                    "QQQ 모멘텀(%)":round(float(row["qqq_mom"]),2),
-                    "TNX 변화율(%)":round(float(row["tnx_chg"]),2)})
-        records.append({"date":dt,"oracle":o_qqq*qp+o_soxl*sp,"dca":b_qqq*qp,
-                        "in_soxl":in_soxl,"entry":row.get("entry",False),
-                        "exit_sig":row.get("exit_sig",False),
-                        "VIX":float(row["VIX"]),
-                        "qqq_mom":float(row.get("qqq_mom",np.nan)),
-                        "tnx_chg":float(row.get("tnx_chg",np.nan))})
-    return pd.DataFrame(records).set_index("date"), pd.DataFrame(trade_log)
+                exit_v[i]=True
+                trade_log.append({"날짜":idx[i].date(),"액션":"SOXL→QQQ",
+                    "VIX":round(vix_a[i],1),
+                    "QQQ 모멘텀(%)":round(float(mom_a[i]),2),
+                    "TNX 변화율(%)":round(float(tnx_a[i]),2)})
+        oracle_v[i]=o_qqq*qp+o_soxl*sp; dca_v[i]=b_qqq*qp; insoxl_v[i]=in_soxl
+
+    results = pd.DataFrame({
+        "oracle":oracle_v, "dca":dca_v, "in_soxl":insoxl_v,
+        "entry":entry_v,   "exit_sig":exit_v,
+        "VIX":vix_a,       "qqq_mom":mom_a, "tnx_chg":tnx_a,
+    }, index=idx)
+    return results, pd.DataFrame(trade_log)
 
 
 # ── METRICS ──────────────────────────────────────────────────
@@ -188,21 +240,32 @@ with st.sidebar:
     st.caption("📌 개인 교육용 도구 | 과거 수익률은 미래를 보장하지 않습니다.")
 
 
+# ── PIPELINE CACHE ───────────────────────────────────────────
+# 파라미터가 같으면 재계산 없이 즉시 반환 (슬라이더 반응 속도 핵심)
+@st.cache_data(show_spinner=False)
+def run_pipeline(vix_t, mom_t, tnx_t, initial_cap, monthly_inv):
+    raw = load_data("2014-01-01")   # load_data 자체도 캐시됨
+    if raw is None:
+        return None
+    sig    = compute_signals(raw, vix_t, 20, mom_t, 60, tnx_t)
+    bt, tr = run_backtest(sig, initial_cap, monthly_inv)
+    con    = build_contributions(bt.index, initial_cap, monthly_inv)
+    om     = calc_metrics(bt["oracle"], con)
+    dm     = calc_metrics(bt["dca"],    con)
+    yr     = (sig.index[-1]-sig.index[0]).days/365.25
+    qc     = ((sig["QQQ"].iloc[-1]/sig["QQQ"].iloc[0])**(1/yr)-1)*100
+    return sig, bt, tr, con, om, dm, qc
+
+
 # ── LOAD & COMPUTE ───────────────────────────────────────────
 st.markdown("# 🔮 나스닥 하이브리드 오라클 전략")
 st.markdown("QQQ ↔ SOXL 스위칭 전략 | 10년 백테스트 검증 대시보드 · 개인 교육용")
 
-with st.spinner("📡 데이터 로딩 중 (약 10~20초)..."):
-    raw = load_data("2014-01-01")
-if raw is None: st.stop()
+with st.spinner("📡 데이터 로딩 중..."):
+    result = run_pipeline(vix_t, mom_t, tnx_t, initial_cap, monthly_inv)
+if result is None: st.stop()
 
-sig_df     = compute_signals(raw, vix_t, 20, mom_t, 60, tnx_t)
-bt, trades = run_backtest(sig_df, initial_cap, monthly_inv)
-contrib    = build_contributions(bt.index, initial_cap, monthly_inv)
-om         = calc_metrics(bt["oracle"], contrib)
-dm         = calc_metrics(bt["dca"],    contrib)
-_yr        = (sig_df.index[-1]-sig_df.index[0]).days/365.25
-qqq_cagr   = ((sig_df["QQQ"].iloc[-1]/sig_df["QQQ"].iloc[0])**(1/_yr)-1)*100
+sig_df, bt, trades, contrib, om, dm, qqq_cagr = result
 
 
 # ── TABS ─────────────────────────────────────────────────────
