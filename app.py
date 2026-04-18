@@ -36,46 +36,40 @@ div[data-testid="stMetricValue"]    { color:#ddddf0 !important; }
 # ── DATA ─────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data(start="2014-01-01"):
-    import time, requests_cache
+    import time
     end    = datetime.today().strftime("%Y-%m-%d")
-    # 브라우저 User-Agent + 디스크 캐시 (1시간) → 차단 방지
-    sess   = requests_cache.CachedSession("yf_cache", expire_after=3600)
-    sess.headers.update({
-        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/122.0.0.0 Safari/537.36"),
-        "Accept-Language": "en-US,en;q=0.5",
-    })
+    # 최신 yfinance(0.2.40+)는 curl_cffi를 내부적으로 사용하므로
+    # 커스텀 세션을 주입하면 오히려 오류가 납니다. yfinance에 맡깁니다.
     frames = {}
     for col, sym in {"QQQ":"QQQ","SOXL":"SOXL","VIX":"^VIX","TNX":"^TNX"}.items():
         ok = False
-        # 방법 1: Ticker().history() — 야후 차단 우회에 더 안정적
+        # Ticker().history() — download()보다 안정적
         for attempt in range(3):
             try:
-                raw = yf.Ticker(sym, session=sess).history(
+                raw = yf.Ticker(sym).history(
                     start=start, end=end, auto_adjust=True)
                 if not raw.empty:
                     s = raw["Close"]
                     frames[col] = s.squeeze() if isinstance(s, pd.DataFrame) else s
                     ok = True; break
             except Exception:
-                time.sleep(2 ** attempt)
-        # 방법 2: download() 폴백
+                time.sleep(2 ** attempt)   # 1초 → 2초 → 4초 재시도
+        # 폴백: download()
         if not ok:
             try:
                 raw = yf.download(sym, start=start, end=end,
-                                  progress=False, auto_adjust=True, session=sess)
+                                  progress=False, auto_adjust=True)
                 if not raw.empty:
                     s = raw["Close"]
                     frames[col] = s.squeeze() if isinstance(s, pd.DataFrame) else s
                     ok = True
             except Exception as e:
-                st.error(f"❌ {sym} 로드 실패: {e}  \n새로고침(F5)하거나 잠시 후 다시 시도하세요.")
+                st.error(f"❌ {sym} 로드 실패: {e}\n새로고침(F5)하거나 잠시 후 다시 시도하세요.")
                 return None
         if not ok:
             st.error(f"❌ {sym} 데이터를 가져올 수 없습니다. 네트워크를 확인하세요.")
             return None
-        time.sleep(0.6)   # 요청 간 딜레이 — 차단 방지
+        time.sleep(0.5)
     df = pd.DataFrame(frames).ffill().dropna(subset=["QQQ","VIX"])
     df["SOXL"] = df["SOXL"].fillna(df["QQQ"])
     return df
