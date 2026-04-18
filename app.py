@@ -248,7 +248,7 @@ def run_pipeline(vix_t, mom_t, tnx_t, initial_cap, monthly_inv):
     dm     = calc_metrics(bt["dca"],    con)
     yr     = (sig.index[-1]-sig.index[0]).days/365.25
     qc     = ((sig["QQQ"].iloc[-1]/sig["QQQ"].iloc[0])**(1/yr)-1)*100
-    return sig, bt, tr, con, om, dm, qc
+    return raw, sig, bt, tr, con, om, dm, qc
 
 
 # ── LOAD & COMPUTE ───────────────────────────────────────────
@@ -259,7 +259,7 @@ with st.spinner("📡 데이터 로딩 중..."):
     result = run_pipeline(vix_t, mom_t, tnx_t, initial_cap, monthly_inv)
 if result is None: st.stop()
 
-sig_df, bt, trades, contrib, om, dm, qqq_cagr = result
+raw, sig_df, bt, trades, contrib, om, dm, qqq_cagr = result
 
 
 # ── TABS ─────────────────────────────────────────────────────
