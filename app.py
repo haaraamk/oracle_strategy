@@ -446,8 +446,7 @@ with tab1:
     fig_ann.add_hline(y=0, line=dict(color="#374151", width=1))
     fig_ann.update_layout(**LAY, height=300, barmode="group",
         xaxis=dict(**AX), yaxis=dict(**AX, title="연간 수익률 (%)"),
-        legend=dict(bgcolor="rgba(10,10,20,0.85)", bordercolor="#2a2a3a", borderwidth=1),
-        margin=dict(l=60, r=20, t=20, b=40))
+        legend=dict(bgcolor="rgba(10,10,20,0.85)", bordercolor="#2a2a3a", borderwidth=1))
     st.plotly_chart(fig_ann, use_container_width=True)
 
     # ── 낙폭 차트 ──────────────────────────────────────────
